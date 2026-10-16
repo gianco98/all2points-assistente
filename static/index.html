@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assistente All2Points</title>
+<link rel="icon" href="/static/logo.svg">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="theme-color" content="#111111">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<aside id="lato">
+  <div class="marchio"><img src="/static/logo.svg" alt=""><div><strong>ALL2POINTS</strong><span>Assistente</span></div></div>
+
+  <label class="etichetta" for="progetto">Progetto</label>
+  <div class="riga">
+    <select id="progetto"></select>
+    <button class="icona" commandfor="dlg-progetto" command="show-modal" title="Nuovo progetto" aria-label="Nuovo progetto">+</button>
+  </div>
+
+  <button id="nuova-chat" class="primario">Nuova chat</button>
+  <nav id="chat-elenco" aria-label="Chat del progetto"></nav>
+
+  <div class="piede">
+    <div id="strumenti" class="strumenti"></div>
+    <div id="spesa-mese" class="spesa"></div>
+    <div id="versione" class="spesa"></div>
+    <button class="secondario" commandfor="dlg-impostazioni" command="show-modal">Impostazioni</button>
+  </div>
+</aside>
+
+<main>
+  <header>
+    <h1 id="titolo-chat">Nuova chat</h1>
+    <div class="comandi">
+      <select id="modello" aria-label="Modello">
+        <option value="opus">Opus · montaggio e lavori difficili</option>
+        <option value="sonnet">Sonnet · lavoro normale, costa la metà</option>
+        <option value="haiku">Haiku · cose semplici, costa pochissimo</option>
+      </select>
+      <span id="costo" class="spesa" title="Spesa di questa chat"></span>
+    </div>
+  </header>
+
+  <section id="messaggi" aria-live="polite"></section>
+
+  <form id="scrivi">
+    <div id="allegati" class="allegati"></div>
+    <div class="campo">
+      <label class="allega" title="Allega file o immagini">
+        <input type="file" id="file" multiple hidden>📎
+      </label>
+      <textarea id="testo" rows="1" placeholder="Scrivi a Claude… (Invio per mandare, Maiusc+Invio per andare a capo; puoi incollare screenshot)"></textarea>
+      <button type="submit" id="invia" class="primario">Invia</button>
+      <button type="button" id="stop" class="pericolo" hidden>Stop</button>
+    </div>
+  </form>
+</main>
+
+<dialog id="dlg-progetto">
+  <form method="dialog" id="form-progetto">
+    <h2>Nuovo progetto</h2>
+    <p>Un progetto per cliente o lavoro (es. «Cliente Rossi», «Sito Bianchi»). Tiene insieme chat, allegati e riassunti.</p>
+    <input id="nome-progetto" required placeholder="Nome del progetto" autocomplete="off">
+    <div class="azioni">
+      <button type="button" class="secondario" commandfor="dlg-progetto" command="close">Annulla</button>
+      <button class="primario" value="ok">Crea</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-impostazioni">
+  <form method="dialog" id="form-impostazioni">
+    <h2>Impostazioni</h2>
+    <label>Il tuo nome<input id="imp-nome" placeholder="es. Gianco" autocomplete="off"></label>
+    <label>Chiave API della Console
+      <input id="imp-chiave" type="password" placeholder="sk-ant-… (lascia vuoto per non cambiarla)" autocomplete="off">
+    </label>
+    <p id="imp-chiave-stato" class="nota"></p>
+    <label>Modello predefinito
+      <select id="imp-modello"><option value="opus">Opus</option><option value="sonnet">Sonnet</option><option value="haiku">Haiku</option></select>
+    </label>
+    <label>Dischi e cartelle extra a cui può accedere (uno per riga)
+      <textarea id="imp-cartelle" rows="3" placeholder="/Volumes/SSD 2&#10;/Volumes/BACKUP 3"></textarea>
+    </label>
+    <fieldset>
+      <legend>Browser</legend>
+      <label class="scelta"><input type="radio" name="browser" value="separato"> Chrome separato: i login si fanno una volta in quella finestra</label>
+      <label class="scelta"><input type="radio" name="browser" value="mio"> Il mio Chrome, con i login che ho già</label>
+      <div id="imp-mio" class="sotto-scelta">
+        <p class="nota">1. Installa la <a href="https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm" target="_blank" rel="noopener">Playwright Extension</a> nel tuo Chrome.<br>
+        2. Clicca sull'icona dell'estensione e copia il codice <code>PLAYWRIGHT_MCP_EXTENSION_TOKEN</code>.<br>
+        3. Incollalo qui: così non devi approvare il collegamento ogni volta.</p>
+        <input id="imp-token" type="password" placeholder="Codice dell'estensione (lascia vuoto per non cambiarlo)" autocomplete="off">
+        <p id="imp-token-stato" class="nota"></p>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Avvisi sul telefono</legend>
+      <p class="nota">Installa l'app gratuita <strong>ntfy</strong> sul telefono, premi «+» e iscriviti a questo argomento:</p>
+      <code id="imp-topic"></code>
+      <button type="button" id="prova-avviso" class="secondario">Manda un avviso di prova</button>
+    </fieldset>
+    <p id="imp-errore" class="errore" role="alert"></p>
+    <div class="azioni">
+      <button type="button" class="secondario" commandfor="dlg-impostazioni" command="close">Chiudi</button>
+      <button class="primario" value="ok">Salva</button>
+    </div>
+  </form>
+</dialog>
+
+<template id="tpl-permesso">
+  <div class="permesso">
+    <p><strong>Claude chiede il permesso:</strong> <span class="dettaglio"></span></p>
+    <details><summary>Dettagli</summary><pre></pre></details>
+    <div class="azioni">
+      <button class="secondario" data-r="no">Nega</button>
+      <button class="secondario" data-r="sempre">Consenti sempre in questa chat</button>
+      <button class="primario" data-r="si">Consenti</button>
+    </div>
+  </div>
+</template>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
