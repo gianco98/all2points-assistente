@@ -234,7 +234,19 @@ def crea_collegamenti() -> None:
 
 # ---------- avvio ----------
 
+def completa_path() -> None:
+    """Aperta dal Dock, l'app su Mac riceve un PATH ridotto (/usr/bin:/bin…) e non trova Node,
+    che serve a DaVinci e al browser automatico. Si aggiungono le cartelle dove di solito sta."""
+    cartelle = [Path.home() / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    cartelle += sorted((Path.home() / ".nvm" / "versions" / "node").glob("*/bin"), reverse=True)[:1]
+    attuali = os.environ.get("PATH", "").split(os.pathsep)
+    nuove = [str(c) for c in cartelle if c.is_dir() and str(c) not in attuali]
+    if nuove:
+        os.environ["PATH"] = os.pathsep.join(nuove + attuali)
+
+
 def main() -> None:
+    completa_path()
     # L'icona di Windows parte con la cartella app come cartella di lavoro: spostarsi fuori,
     # altrimenti Windows non permette di sostituirla durante l'aggiornamento.
     BASE.mkdir(parents=True, exist_ok=True)
