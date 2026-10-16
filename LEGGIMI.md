@@ -14,7 +14,11 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
 1. **Chiave API:** su platform.claude.com › Chiavi API › Crea chiave, con ambito «Workspace predefinito». Ognuno crea la sua. In «Limiti di spesa» si può mettere un tetto per persona.
 2. **Node.js (LTS)** da nodejs.org e **Google Chrome**: servono per il browser automatico e per l'estensione DaVinci.
 3. **Scarica l'installatore** ed eseguilo:
-   - **Mac:** `Installa (Mac).command`. La prima volta macOS lo blocca: Impostazioni di Sistema › Privacy e sicurezza › «Apri comunque».
+   - **Mac:** apri il Terminale e incolla questa riga (è il modo più semplice, macOS non la blocca):
+     ```
+     curl -LsSf https://astral.sh/uv/install.sh | sh && ~/.local/bin/uv run --script https://raw.githubusercontent.com/gianco98/all2points-assistente/main/avvia.py --installa
+     ```
+     In alternativa c'è `Installa (Mac).command`, ma macOS lo blocca: va sbloccato da Impostazioni di Sistema › Privacy e sicurezza › «Apri comunque».
    - **Windows:** `Installa (Windows).bat`. Se compare «Windows ha protetto il PC», scegli «Ulteriori informazioni › Esegui comunque».
 4. **L'installatore pensa al resto:**
    - scarica l'app;
