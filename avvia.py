@@ -87,7 +87,16 @@ def aggiorna(sha: str) -> bool:
         vecchia = BASE / "app-vecchia"
         shutil.rmtree(vecchia, ignore_errors=True)
         if APP.exists():
-            APP.rename(vecchia)
+            # Su Windows una cartella in uso non si può rinominare: dopo lo spegnimento del motore
+            # i file vengono rilasciati con un attimo di ritardo, quindi si riprova per qualche secondo.
+            for tentativo in range(20):
+                try:
+                    APP.rename(vecchia)
+                    break
+                except OSError:
+                    if tentativo == 19:
+                        raise
+                    time.sleep(0.5)
         shutil.move(str(nuova), str(APP))
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(vecchia, ignore_errors=True)
@@ -218,7 +227,7 @@ def crea_collegamenti() -> None:
                 "$s.WorkingDirectory=$env:A2P_DIR;$s.IconLocation=$env:A2P_ICO;$s.Save()"
             )
             env = dict(os.environ, A2P_LNK=str(lnk), A2P_UV=uv, A2P_ARGS=f'run --script "{avvia}"',
-                       A2P_DIR=str(APP), A2P_ICO=str(icona))
+                       A2P_DIR=str(BASE), A2P_ICO=str(icona))
             subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], env=env, check=False)
         log("Icona creata sulla Scrivania e nel menu Start")
 
@@ -226,6 +235,10 @@ def crea_collegamenti() -> None:
 # ---------- avvio ----------
 
 def main() -> None:
+    # L'icona di Windows parte con la cartella app come cartella di lavoro: spostarsi fuori,
+    # altrimenti Windows non permette di sostituirla durante l'aggiornamento.
+    BASE.mkdir(parents=True, exist_ok=True)
+    os.chdir(BASE)
     installa = "--installa" in sys.argv
     dopo_aggiornamento = "--dopo-aggiornamento" in sys.argv
 
@@ -252,7 +265,6 @@ def main() -> None:
         return
 
     sys.path.insert(0, str(APP))
-    os.chdir(APP)
     import app  # noqa: E402  (l'app aggiornata, appena scaricata)
     app.avvia(apri_finestra)
 
