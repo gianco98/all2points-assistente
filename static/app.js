@@ -232,7 +232,7 @@ async function apriChat(sid, titolo) {
     }
     caricaChat();
   }
-  invia({ tipo: 'apri', progetto: stato.progetto, sessione: sid, modello: el.modello.value });
+  invia({ tipo: 'apri', progetto: stato.progetto, sessione: sid, modello: el.modello.value, permessi: $('#permessi').value });
 }
 
 async function eliminaChat(c) {
@@ -292,6 +292,11 @@ el.testo.addEventListener('keydown', (e) => {
 });
 el.stop.addEventListener('click', () => invia({ tipo: 'stop' }));
 el.modello.addEventListener('change', () => invia({ tipo: 'modello', modello: el.modello.value }));
+$('#permessi').addEventListener('change', () => {
+  const modo = $('#permessi').value;
+  invia({ tipo: 'permessi', modo });
+  api('/api/impostazioni', { method: 'POST', body: JSON.stringify({ permessi: modo }) }).catch(() => {});
+});
 el.progetto.addEventListener('change', () => { if (!stato.lavoro) cambiaProgetto(); });
 $('#nuova-chat').addEventListener('click', () => { if (!stato.lavoro) { apriChat(null); caricaChat(); } });
 el.file.addEventListener('change', () => { caricaFile([...el.file.files]); el.file.value = ''; });
@@ -329,6 +334,7 @@ async function caricaStato() {
     ? 'Codice salvato ✓'
     : 'Senza codice, la prima volta che Claude usa il browser ti chiede di approvare il collegamento in Chrome.';
   if (!el.modello.dataset.toccato) el.modello.value = s.modello;
+  $('#permessi').value = s.permessi;
   el.spesaMese.textContent = `Speso questo mese: ${dollari(s.spesa_mese)}`;
   $('#versione').textContent = `Versione ${s.versione}`;
   const t = s.strumenti;

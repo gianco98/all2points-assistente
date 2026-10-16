@@ -68,6 +68,9 @@ CLAUDE_APP = (
     else Path.home() / "Library" / "Application Support" / "Claude"
 )
 MODELLI = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}
+# Permessi: "auto" valuta il rischio di ogni azione, fa da solo quelle sicure e blocca quelle pericolose;
+# "chiedi" chiede conferma per comandi e modifiche ai file.
+PERMESSI = {"auto": "auto", "chiedi": "default"}
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.83"
 # Strumenti che non chiedono conferma: lettura, skill, DaVinci, browser e avvisi.
 # Comandi e modifiche ai file chiedono sempre, con l'opzione "consenti sempre in questa chat".
@@ -114,6 +117,7 @@ def prepara_cartelle() -> None:
         cfg["avvisi_topic"] = "a2p-" + uuid.uuid4().hex[:16]
     cfg.setdefault("nome", "")
     cfg.setdefault("modello", "opus")
+    cfg.setdefault("permessi", "auto")
     cfg.setdefault("cartelle_extra", [])
     cfg.setdefault("spesa_mese", {})
     salva_config(cfg)
@@ -367,6 +371,7 @@ async def stato():
         "chiave": bool(chiave()),
         "nome": cfg.get("nome", ""),
         "modello": cfg.get("modello", "opus"),
+        "permessi": cfg.get("permessi", "auto"),
         "avvisi_topic": cfg.get("avvisi_topic"),
         "cartelle_extra": cfg.get("cartelle_extra", []),
         "browser_modo": cfg.get("browser_modo", "separato"),
@@ -389,6 +394,8 @@ async def impostazioni(request: Request):
         salva_segreto(KEYRING, k)
     if dati.get("estensione_token"):
         salva_segreto(KEYRING_ESTENSIONE, dati["estensione_token"].strip())
+    if dati.get("permessi") in PERMESSI:
+        cfg["permessi"] = dati["permessi"]
     if dati.get("browser_modo") in ("separato", "mio"):
         cfg["browser_modo"] = dati["browser_modo"]
     for campo in ("nome", "modello"):
@@ -553,7 +560,7 @@ async def sessione(ws: WebSocket):
                 pass
         stato["client"] = None
 
-    async def apri(progetto: str, sid: str | None, modello: str):
+    async def apri(progetto: str, sid: str | None, modello: str, permessi: str):
         await chiudi()
         cartella = cartella_progetto(progetto)
         (cartella / "allegati").mkdir(exist_ok=True)
@@ -578,6 +585,7 @@ async def sessione(ws: WebSocket):
             skills="all",
             mcp_servers=server,
             can_use_tool=chiedi_permesso,
+            permission_mode=PERMESSI.get(permessi, "auto"),
             include_partial_messages=True,
             resume=sid,
             add_dirs=[str(BASE), *extra],
@@ -635,7 +643,8 @@ async def sessione(ws: WebSocket):
             tipo = dati.get("tipo")
             try:
                 if tipo == "apri":
-                    await apri(dati["progetto"], dati.get("sessione"), dati.get("modello", "opus"))
+                    await apri(dati["progetto"], dati.get("sessione"), dati.get("modello", "opus"),
+                               dati.get("permessi", leggi_config().get("permessi", "auto")))
                 elif tipo == "messaggio" and stato["client"]:
                     if stato["lavoro"] and not stato["lavoro"].done():
                         await invia(tipo="errore", testo="Sto ancora lavorando: aspetta o premi Stop.")
@@ -649,6 +658,8 @@ async def sessione(ws: WebSocket):
                         if not futuro.done():
                             futuro.set_result("no")
                     await stato["client"].interrupt()
+                elif tipo == "permessi" and stato["client"]:
+                    await stato["client"].set_permission_mode(PERMESSI.get(dati.get("modo"), "auto"))
                 elif tipo == "modello" and stato["client"]:
                     await stato["client"].set_model(MODELLI.get(dati.get("modello"), MODELLI["opus"]))
                 elif tipo == "permesso":

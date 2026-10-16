@@ -31,7 +31,10 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
 - **Progetti:** uno per cliente o lavoro, ognuno con le sue chat e il suo `riassunto.md`.
 - **Chat:** restano salvate con tutto il contesto. Si riprendono anche dopo aver spento il computer.
 - **Modelli:** Opus per montaggio e lavori difficili, Sonnet per il lavoro normale, Haiku per le cose semplici.
-- **Permessi:** lettura, skill, DaVinci, browser e avvisi vanno da soli; comandi e modifiche ai file chiedono conferma.
+- **Permessi** (in alto, accanto al modello):
+  - **Automatico** (predefinito): Claude valuta il rischio di ogni azione, fa da solo comandi e modifiche sicure e blocca quelle pericolose (cancellazioni pesanti, pubblicazioni…); chiede solo nei casi dubbi.
+  - **Chiedi conferma**: comandi e modifiche ai file chiedono sempre «Consenti» o «Nega».
+  - In tutte e due le modalità lettura, skill, DaVinci, browser e avvisi vanno da soli.
 - **Versione:** è indicata in basso a sinistra.
 
 ## Browser
