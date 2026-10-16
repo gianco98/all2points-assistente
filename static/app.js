@@ -81,6 +81,7 @@ function vuoto() {
 }
 function inLavoro(si) {
   stato.lavoro = si;
+  el.elenco.querySelector('a[aria-current="true"]')?.classList.toggle('in-corso', si);
   el.invia.hidden = si;
   el.stop.hidden = !si;
   indicatore(si);
@@ -112,7 +113,11 @@ function ricevi(m) {
       for (const d of stato.inAttesa.splice(0)) invia(d);
       break;
     case 'sessione':
-      if (m.id && m.id !== stato.sessione) { stato.sessione = m.id; }
+      if (m.id && m.id !== stato.sessione) {
+        stato.sessione = m.id;
+        ultimaChat.salva(stato.progetto, m.id);
+        caricaChat();
+      }
       break;
     case 'testo':
       indicatore(false);
@@ -138,7 +143,7 @@ function ricevi(m) {
       el.costo.textContent = `Questa chat: ${dollari(m.costo)}`;
       el.spesaMese.textContent = `Speso questo mese: ${dollari(m.spesa_mese)}`;
       if (m.sessione) { stato.sessione = m.sessione; ultimaChat.salva(stato.progetto, m.sessione); }
-      caricaChat();
+      caricaChat().then(() => { stato.titoloProvvisorio = null; });
       break;
     case 'errore':
       inLavoro(false);
@@ -208,7 +213,19 @@ async function caricaChat() {
       if (!stato.lavoro) apriChat(c.id, c.titolo);
     });
     a.addEventListener('dblclick', () => rinominaChat(c));
+    if (c.id === stato.sessione && stato.lavoro) a.classList.add('in-corso');
     el.elenco.append(a);
+  }
+  // Chat appena iniziata: compare subito in cima, anche prima che sia salvata sul disco.
+  if (stato.titoloProvvisorio && !chat.some((c) => c.id === stato.sessione)) {
+    const a = document.createElement('a');
+    a.href = '#';
+    a.className = stato.lavoro ? 'in-corso' : '';
+    a.setAttribute('aria-current', 'true');
+    a.innerHTML = '<span></span>';
+    a.querySelector('span').textContent = stato.titoloProvvisorio;
+    a.addEventListener('click', (e) => e.preventDefault());
+    el.elenco.prepend(a);
   }
   return chat;
 }
@@ -280,11 +297,16 @@ el.form.addEventListener('submit', (e) => {
   if ((!testo && !stato.allegati.length) || stato.lavoro) return;
   const dati = { tipo: 'messaggio', testo: testo || 'Guarda gli allegati.', allegati: stato.allegati.map((a) => a.percorso) };
   aggiungi('msg utente', testo + (stato.allegati.length ? `\n📎 ${stato.allegati.map((a) => a.nome).join(', ')}` : ''));
+  if (!stato.sessione) {
+    stato.titoloProvvisorio = (testo || 'Allegati').slice(0, 70);
+    el.titolo.textContent = stato.titoloProvvisorio;
+  }
   el.testo.value = '';
   stato.allegati = [];
   mostraAllegati();
   stato.bolla = null;
   inLavoro(true);
+  if (stato.titoloProvvisorio && !stato.sessione) caricaChat();
   if (stato.pronto) invia(dati); else stato.inAttesa.push(dati);
 });
 el.testo.addEventListener('keydown', (e) => {
