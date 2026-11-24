@@ -73,6 +73,8 @@ select, input, textarea { background: var(--pannello); border: 1px solid var(--b
 .strumenti details .strumenti { max-height: 30vh; overflow-y: auto; padding-top: .35rem; }
 .spesa { font-size: .82em; color: var(--tenue); }
 #lato .spesa { color: #a8a8a8; }
+#contesto.alto { color: #b7791f; }
+#contesto.pieno { color: #c53030; font-weight: 600; }
 
 /* ---- area chat ---- */
 main { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; min-width: 0; }

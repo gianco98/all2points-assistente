@@ -4,7 +4,7 @@ const el = {
   progetto: $('#progetto'), elenco: $('#chat-elenco'), messaggi: $('#messaggi'), testo: $('#testo'),
   form: $('#scrivi'), invia: $('#invia'), stop: $('#stop'), modello: $('#modello'), costo: $('#costo'),
   titolo: $('#titolo-chat'), allegati: $('#allegati'), file: $('#file'), strumenti: $('#strumenti'),
-  spesaMese: $('#spesa-mese'),
+  spesaMese: $('#spesa-mese'), contesto: $('#contesto'),
 };
 
 let stato = { progetto: null, sessione: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [] };
@@ -112,6 +112,16 @@ function ricevi(m) {
       stato.pronto = true;
       for (const d of stato.inAttesa.splice(0)) invia(d);
       break;
+    case 'contesto': {
+      const k = (n) => `${Math.round(n / 1000)}k`;
+      const perc = m.massimo ? Math.round((m.usati / m.massimo) * 100) : 0;
+      el.contesto.textContent = `Contesto: ${k(m.usati)} su ${k(m.massimo)} (${perc}%)`;
+      el.contesto.className = 'spesa' + (perc >= 90 ? ' pieno' : perc >= 70 ? ' alto' : '');
+      el.contesto.title = m.auto
+        ? `Quando arriva a ${k(m.massimo)} la chat si riassume da sola. Sopra il 70% conviene aprire una chat nuova: costa meno.`
+        : 'La compattazione automatica è spenta.';
+      break;
+    }
     case 'connettori':
       stato.connettori = m.voci;
       mostraStrumenti();
@@ -245,6 +255,7 @@ async function apriChat(sid, titolo) {
   stato.bolla = null;
   stato.pronto = false;
   el.costo.textContent = '';
+  el.contesto.textContent = '';
   el.titolo.textContent = titolo || 'Nuova chat';
   el.elenco.querySelectorAll('a').forEach((a) => a.removeAttribute('aria-current'));
   vuoto();

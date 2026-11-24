@@ -930,6 +930,18 @@ async def sessione(ws: WebSocket):
         stato.update(client=client, progetto=cartella, consentiti=set(), costo=0.0)
         await invia(tipo="pronto", davinci=bool(davinci), browser=bool(browser))
         stato["controllo"] = asyncio.create_task(controlla_connettori(client))
+        if sid:
+            await invia_contesto(client)
+
+    async def invia_contesto(client) -> None:
+        """Quanto contesto usa la chat e a che punto si compatta da sola (come /context in Claude Code)."""
+        try:
+            uso = await client.get_context_usage()
+        except Exception:
+            return
+        await invia(tipo="contesto", usati=uso.get("totalTokens", 0),
+                    massimo=uso.get("autoCompactThreshold") or uso.get("maxTokens", 0),
+                    auto=uso.get("isAutoCompactEnabled", True))
 
     async def leggi_connettori(client) -> None:
         stato["mcp"] = await client.get_mcp_status()
@@ -1011,6 +1023,7 @@ async def sessione(ws: WebSocket):
                     await invia(tipo="fine", costo=stato["costo"], sessione=m.session_id,
                                 errore=spiega_errore(m.result or m.subtype) if m.is_error else None,
                                 spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
+            await invia_contesto(client)
             if time.monotonic() - inizio > 120:
                 await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{stato['progetto'].name}».")
         except asyncio.CancelledError:
