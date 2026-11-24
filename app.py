@@ -749,6 +749,24 @@ def ricorda_chat(progetto: Path, sid: str) -> None:
             f.write(sid + "\n")
 
 
+def costi_chat(progetto: Path) -> dict:
+    """L'ultimo costo totale visto per ogni chat del progetto. Serve perché il motore, quando riprende
+    una chat, riparte dal suo totale: senza, la spesa del mese conterebbe di nuovo i turni passati."""
+    try:
+        return json.loads((progetto / "costi-chat.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def ricorda_costo(progetto: Path, sid: str, totale: float) -> None:
+    costi = costi_chat(progetto)
+    costi[sid] = totale
+    try:
+        (progetto / "costi-chat.json").write_text(json.dumps(costi), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def chat_permessa(sid: str, progetto: str) -> None:
     ammesse = chat_dell_app(progetto)
     if ammesse is not None and sid not in ammesse:
@@ -988,10 +1006,15 @@ async def sessione(ws: WebSocket):
         )
         client = ClaudeSDKClient(options=opzioni)
         await client.connect()
-        stato.update(client=client, progetto=cartella, cartella_lavoro=lavoro, consentiti=set(), costo=0.0)
+        # Chat ripresa: si parte dal totale già visto. None = chat nata prima di questo conteggio,
+        # il suo primo turno qui non si somma alla spesa del mese (conterebbe anche il passato).
+        costo = costi_chat(cartella).get(sid) if sid else 0.0
+        stato.update(client=client, progetto=cartella, cartella_lavoro=lavoro, consentiti=set(), costo=costo)
         await invia(tipo="pronto", davinci=bool(davinci), browser=bool(browser))
         stato["controllo"] = asyncio.create_task(controlla_connettori(client))
         if sid:
+            if costo:
+                await invia(tipo="costo", costo=costo)
             await invia_contesto(client)
 
     async def invia_contesto(client) -> None:
@@ -1089,11 +1112,14 @@ async def sessione(ws: WebSocket):
                     ricorda_chat(stato["progetto"], m.data.get("session_id"))
                     await invia(tipo="sessione", id=m.data.get("session_id"))
                 elif isinstance(m, ResultMessage):
+                    # total_cost_usd è il totale della chat (anche dei turni di prima): si somma solo la differenza.
                     if m.total_cost_usd is not None:
+                        if costo_prima is not None:
+                            registra_spesa(m.total_cost_usd - costo_prima)
                         stato["costo"] = m.total_cost_usd
-                    registra_spesa(stato["costo"] - costo_prima)
+                        ricorda_costo(stato["progetto"], m.session_id, m.total_cost_usd)
                     ricorda_chat(stato["progetto"], m.session_id)
-                    await invia(tipo="fine", costo=stato["costo"], sessione=m.session_id,
+                    await invia(tipo="fine", costo=stato["costo"] or 0.0, sessione=m.session_id,
                                 errore=spiega_errore(m.result or m.subtype) if m.is_error else None,
                                 spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
             await invia_contesto(client)

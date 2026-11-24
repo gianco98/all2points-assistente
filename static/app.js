@@ -133,6 +133,9 @@ function ricevi(m) {
       stato.pronto = true;
       for (const d of stato.inAttesa.splice(0)) invia(d);
       break;
+    case 'costo':
+      el.costo.textContent = `Questa chat: ${dollari(m.costo)}`;
+      break;
     case 'contesto': {
       const k = (n) => `${Math.round(n / 1000)}k`;
       const perc = m.massimo ? Math.round((m.usati / m.massimo) * 100) : 0;
