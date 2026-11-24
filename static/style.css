@@ -354,6 +354,23 @@ fieldset:has(input[value="separato"]:checked) .sotto-scelta { display: none; }
 .azioni { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 dialog .azioni { padding: 12px 24px 16px; border-top: 1px solid var(--bordo); }
 
+/* ---- attività programmate ---- */
+.att-elenco { display: flex; flex-direction: column; gap: 8px; }
+.att-elenco:empty::before { content: "Nessuna attività ancora."; color: var(--tenue); font-size: 13px; }
+.att { display: flex; flex-direction: column; gap: 2px; padding: 12px 16px; border: 1px solid var(--bordo); border-radius: 12px; }
+.att-testa { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.att-testa strong { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.att-stato { flex: none; padding: 0 8px; font-size: 12px; font-weight: 500; line-height: 20px; border-radius: 10px; background: var(--superficie); color: var(--tenue); }
+.att-stato.attiva { background: var(--accento-tenue); color: var(--accento); }
+.att-stato.lavora { background: var(--avviso); color: #111; }
+.att .nota a { color: var(--accento); }
+.att-azioni { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.att-azioni button { min-height: 28px; padding: 0 12px; font-size: 13px; background: var(--superficie); }
+.att-azioni button:hover { background: var(--superficie-2); }
+.att-campo { display: flex; flex-direction: column; gap: 4px; }
+.att-campo[hidden] { display: none; }
+.giorni { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+
 /* ---- anteprima ---- */
 #anteprima { flex: 0 0 clamp(360px, 40%, 640px); min-width: 0; height: 100vh; height: 100dvh; display: flex; flex-direction: column; gap: 8px; padding: 8px 12px 12px; background: var(--sfondo); border-left: 1px solid var(--bordo); }
 .anteprima-testa { display: flex; justify-content: space-between; align-items: center; min-height: 36px; }

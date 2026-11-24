@@ -1231,6 +1231,160 @@ $('#prova-avviso').addEventListener('click', async () => {
   alert(r.ok ? 'Avviso inviato: controlla il telefono.' : 'Avviso non inviato: controlla la connessione.');
 });
 
+// ---- attività programmate ----
+const GIORNI_SETTIMANA = ['lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato', 'domenica'];
+const attivita = {
+  timer: null,
+  ora: (o) => o.replace(/^0/, ''),
+  parole(r) {
+    const ora = this.ora(r.ora);
+    if (r.tipo === 'giorno') return `ogni giorno alle ${ora}`;
+    if (r.tipo === 'settimana') {
+      const nomi = r.giorni.map((g) => GIORNI_SETTIMANA[g]);
+      const elenco = nomi.length > 1 ? `${nomi.slice(0, -1).join(', ')} e ${nomi.at(-1)}` : nomi[0];
+      return `ogni ${elenco} alle ${ora}`;
+    }
+    if (r.tipo === 'mese') return `il ${r.giorno} di ogni mese alle ${ora}`;
+    const [anno, mese, giorno] = r.data.split('-');
+    return `una volta il ${giorno}/${mese}${Number(anno) === new Date().getFullYear() ? '' : '/' + anno} alle ${ora}`;
+  },
+  data(iso) {
+    const d = new Date(iso);  // senza fuso: il browser lo legge come ora locale, la stessa del motore
+    const due = (n) => String(n).padStart(2, '0');
+    return `${GIORNI_SETTIMANA[(d.getDay() + 6) % 7].slice(0, 3)} ${due(d.getDate())}/${due(d.getMonth() + 1)} ${due(d.getHours())}:${due(d.getMinutes())}`;
+  },
+  riga(a) {
+    const nodo = document.createElement('div');
+    nodo.className = 'att';
+    const testa = document.createElement('div');
+    testa.className = 'att-testa';
+    const nome = document.createElement('strong');
+    nome.textContent = a.nome;
+    const stato = document.createElement('span');
+    const completata = !a.attiva && a.ripeti.tipo === 'una' && a.ultima;
+    stato.className = 'att-stato' + (a.in_esecuzione ? ' lavora' : a.attiva ? ' attiva' : '');
+    stato.textContent = a.in_esecuzione ? 'in esecuzione' : a.attiva ? 'attiva' : completata ? 'completata' : 'in pausa';
+    testa.append(nome, stato);
+    const nota = (testo) => {
+      const p = document.createElement('p');
+      p.className = 'nota';
+      p.textContent = testo;
+      return p;
+    };
+    nodo.append(testa, nota(`${a.progetto} · ${this.parole(a.ripeti)}`));
+    if (a.prossima) nodo.append(nota(`Prossima: ${this.data(a.prossima)}`));
+    const esito = a.esiti?.at(-1);
+    if (esito) {
+      const p = nota(`Ultima: ${this.data(esito.quando)} · ${esito.ok ? 'fatto' : 'errore'}${esito.nota ? ` (${esito.nota})` : ''} · ${dollari(esito.costo)}`);
+      if (esito.sessione) {
+        const apri = document.createElement('a');
+        apri.href = '#';
+        apri.textContent = 'apri';
+        apri.addEventListener('click', (e) => {
+          e.preventDefault();
+          $('#dlg-attivita').close();
+          vaiA(a.progetto, esito.sessione, `⏰ ${a.nome}`);
+        });
+        p.append(' · ', apri);
+      }
+      nodo.append(p);
+    }
+    const azioni = document.createElement('div');
+    azioni.className = 'att-azioni';
+    const bottone = (etichetta, classe, fai) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = classe;
+      b.textContent = etichetta;
+      b.addEventListener('click', async () => {
+        $('#att-errore').textContent = '';
+        try { await fai(); } catch (err) { $('#att-errore').textContent = err.message; }
+        this.carica();
+      });
+      return b;
+    };
+    const chiama = (azione, metodo = 'POST') => () => api(`/api/attivita/${a.id}${azione}`, { method: metodo });
+    if (!completata) azioni.append(a.attiva ? bottone('Pausa', 'secondario', chiama('/pausa')) : bottone('Riprendi', 'secondario', chiama('/riprendi')));
+    azioni.append(
+      bottone('Esegui ora', 'secondario', chiama('/esegui')),
+      bottone('Modifica', 'secondario', async () => this.modifica(a)),
+      bottone('Elimina', 'secondario', async () => {
+        if (confirm(`Eliminare l'attività «${a.nome}»? Non si può annullare.`)) await chiama('', 'DELETE')();
+      }));
+    nodo.append(azioni);
+    return nodo;
+  },
+  async carica() {
+    try {
+      const lista = await api('/api/attivita');
+      $('#att-elenco').replaceChildren(...lista.map((a) => this.riga(a)));
+    } catch (err) { $('#att-errore').textContent = err.message; }
+  },
+  apri() {
+    const progetti = [...el.progetto.options].map((o) => Object.assign(new Option(o.dataset.base || o.text, o.value), { selected: o.value === stato.progetto }));
+    $('#att-progetto').replaceChildren(...progetti);
+    $('#att-errore').textContent = '';
+    this.azzera();
+    this.carica();
+    clearInterval(this.timer);
+    this.timer = setInterval(() => this.carica(), 10000);
+    $('#dlg-attivita').showModal();
+  },
+  modifica(a) {
+    $('#att-id').value = a.id;
+    $('#att-titolo-form').textContent = 'Modifica attività';
+    $('#att-nome').value = a.nome;
+    if ([...$('#att-progetto').options].some((o) => o.value === a.progetto)) $('#att-progetto').value = a.progetto;
+    $('#att-testo').value = a.testo;
+    $('#att-modello').value = a.modello || 'sonnet';
+    const r = a.ripeti;
+    $('#att-tipo').value = r.tipo;
+    $('#att-ora').value = r.ora;
+    document.querySelectorAll('input[name="att-giorno"]').forEach((c) => (c.checked = (r.giorni || []).includes(Number(c.value))));
+    if (r.giorno) $('#att-giorno-mese').value = r.giorno;
+    if (r.data) $('#att-data').value = r.data;
+    $('#att-annulla').hidden = false;
+    this.campi();
+    $('#att-nome').scrollIntoView({ block: 'center' });
+  },
+  azzera() {
+    $('#form-attivita').reset();
+    $('#att-id').value = '';
+    $('#att-titolo-form').textContent = 'Nuova attività';
+    $('#att-annulla').hidden = true;
+    $('#att-progetto').value = stato.progetto;
+    this.campi();
+  },
+  campi() {
+    const tipo = $('#att-tipo').value;
+    document.querySelectorAll('#form-attivita [data-tipo]').forEach((d) => (d.hidden = d.dataset.tipo !== tipo));
+  },
+  ripeti() {
+    const tipo = $('#att-tipo').value;
+    const r = { tipo, ora: $('#att-ora').value };
+    if (tipo === 'settimana') r.giorni = [...document.querySelectorAll('input[name="att-giorno"]:checked')].map((c) => Number(c.value));
+    if (tipo === 'mese') r.giorno = Number($('#att-giorno-mese').value);
+    if (tipo === 'una') r.data = $('#att-data').value;
+    return r;
+  },
+};
+$('#apri-attivita').addEventListener('click', () => attivita.apri());
+$('#dlg-attivita').addEventListener('close', () => clearInterval(attivita.timer));
+$('#att-tipo').addEventListener('change', () => attivita.campi());
+$('#att-annulla').addEventListener('click', () => attivita.azzera());
+$('#form-attivita').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#att-errore').textContent = '';
+  try {
+    await api('/api/attivita', { method: 'POST', body: JSON.stringify({
+      id: $('#att-id').value || undefined, nome: $('#att-nome').value, progetto: $('#att-progetto').value, testo: $('#att-testo').value,
+      modello: $('#att-modello').value, ripeti: attivita.ripeti(),
+    }) });
+    attivita.azzera();
+    attivita.carica();
+  } catch (err) { $('#att-errore').textContent = err.message; }
+});
+
 // ---- avvio ----
 (async () => {
   const s = await caricaStato();

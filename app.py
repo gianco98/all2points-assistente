@@ -15,6 +15,7 @@ Gira solo sul computer di chi la usa (http://127.0.0.1:8765). Ognuno del team us
 """
 
 import asyncio
+import calendar
 import contextlib
 import json
 import os
@@ -29,6 +30,7 @@ import urllib.request
 import uuid
 import warnings
 import webbrowser
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import keyring
@@ -70,6 +72,7 @@ BASE = Path.home() / "All2Points Assistente"
 PROGETTI = BASE / "progetti"
 CONFIG = BASE / "config.json"
 REGOLE = BASE / "Regole di Gianco - correzioni.md"
+FILE_PROGRAMMATE = BASE / "attivita.json"
 PLUGIN_DESKTOP = BASE / "plugin-desktop"
 REPO = "gianco98/all2points-assistente"
 SVILUPPO = BASE / "sviluppo"  # copia del repo in cui l'assistente migliora sé stesso
@@ -623,9 +626,10 @@ Regole, in quest'ordine:
 
 @contextlib.asynccontextmanager
 async def ciclo_vita(_app):
-    pulizia = asyncio.create_task(chiudi_chat_inattive())
+    compiti = [asyncio.create_task(chiudi_chat_inattive()), asyncio.create_task(pianificatore())]
     yield
-    pulizia.cancel()
+    for compito in compiti:
+        compito.cancel()
 
 
 app = FastAPI(lifespan=ciclo_vita)
@@ -952,6 +956,7 @@ CHIUDI_CHAT_DOPO_MINUTI = 15
 CHIUDI_LASCIATA_DOPO_SECONDI = 30  # una chat ferma che nessuno guarda si chiude presto: ogni chat è un processo
 AVVISO_TELEFONO_DOPO_SECONDI = 120
 ATTESA_STOP_SECONDI = 20
+ATTESA_PERMESSO_PROGRAMMATA_SECONDI = 600  # un'attività non ha nessuno che risponda: dopo 10 minuti il permesso si nega
 
 
 class Finestra:
@@ -1037,6 +1042,8 @@ class Chat:
         self.lettore: asyncio.Task | None = None
         self.avvio: asyncio.Task | None = None  # l'avvio del motore: vive anche se la finestra cambia idea a metà
         self.task_attivi: set[str] = set()  # agenti e comandi in background ancora al lavoro
+        self.programmata = False  # chat di un'attività programmata: nessuno a rispondere
+        self.esito: asyncio.Future | None = None  # chat programmata: il ResultMessage che chiude il lavoro (None = chat chiusa)
 
     # ----- avvio e chiusura -----
 
@@ -1097,6 +1104,8 @@ class Chat:
             if CHAT.get(k) is self:
                 del CHAT[k]
         self._nega_permessi()
+        if self.esito and not self.esito.done():
+            self.esito.set_result(None)
         for compito in [self.lettore, *self.compiti]:
             if compito and not compito.done() and compito is not asyncio.current_task():
                 compito.cancel()
@@ -1175,7 +1184,14 @@ class Chat:
                   "completo": json.dumps(dati, ensure_ascii=False, indent=2)[:4000]}
         self.richieste[rid] = {"futuro": futuro, "evento": evento}  # senza spettatori resta in attesa
         await self.invia(**evento)
-        risposta = await futuro
+        if self.programmata:
+            try:
+                risposta = await asyncio.wait_for(futuro, ATTESA_PERMESSO_PROGRAMMATA_SECONDI)
+            except asyncio.TimeoutError:
+                self.richieste.pop(rid, None)
+                risposta = "no"
+        else:
+            risposta = await futuro
         if risposta == "sempre":
             self.consentiti.add(nome)
         if risposta in ("si", "sempre"):
@@ -1370,6 +1386,8 @@ class Chat:
         durata = time.monotonic() - self.inizio
         self.lavora = False
         await aggiorna_in_corso()
+        if self.esito and not self.esito.done():
+            self.esito.set_result(m)
         if dopo is None:
             self._compito(self._finito(durata))
         self.forse_chiudi()
@@ -1383,7 +1401,7 @@ class Chat:
             pass
         titolo = (titolo or self.primo_testo or "Chat")[:60]
         await a_tutte(tipo="chat_finita", progetto=self.nome_progetto, sessione=self.sid, titolo=titolo, chiavi=sorted(self.chiavi))
-        if durata > AVVISO_TELEFONO_DOPO_SECONDI:
+        if durata > AVVISO_TELEFONO_DOPO_SECONDI and not self.programmata:  # le attività avvisano da sole
             await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{self.nome_progetto}».")
 
     # ----- contesto e connettori -----
@@ -1494,6 +1512,321 @@ async def chiudi_chat_inattive() -> None:
         for chat in chat_aperte():
             if not chat.spettatori and chat.libera() and time.monotonic() - chat.ultima > CHIUDI_CHAT_DOPO_MINUTI * 60:
                 await chat.chiudi()
+
+
+# ---------- attività programmate ----------
+
+# Ogni attività è una chat nuova che parte da sola all'ora giusta, con i permessi automatici e nessuno davanti.
+# Gli orari sono ora locale del computer (datetime senza fuso). Partono solo a motore acceso: se il computer
+# o il motore erano spenti all'ora giusta, partono una volta sola al primo avvio successivo.
+GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+TIPI_RIPETI = ("giorno", "settimana", "mese", "una")
+MODELLO_PROGRAMMATE = "sonnet"
+CONTROLLO_PROGRAMMATE_SECONDI = 30
+TOLLERANZA_RITARDO_SECONDI = 120  # oltre questo ritardo l'attività è «recuperata» e la chat lo dice
+DURATA_MASSIMA_PROGRAMMATA_ORE = 3
+ESITI_TENUTI = 5
+BLOCCO_PROGRAMMATE = asyncio.Lock()
+IN_ESECUZIONE: set[str] = set()
+COMPITI_PROGRAMMATE: set[asyncio.Task] = set()
+
+
+def prossima_esecuzione(ripeti: dict, dopo: datetime) -> datetime | None:
+    """La prima occorrenza di «ripeti» strettamente dopo «dopo», in ora locale. None se non ce ne sono più."""
+    try:
+        ora = datetime.strptime(ripeti["ora"], "%H:%M").time()
+        tipo = ripeti["tipo"]
+        if tipo == "una":
+            quando = datetime.combine(date.fromisoformat(ripeti["data"]), ora)
+            return quando if quando > dopo else None
+        if tipo == "mese":
+            for scarto in range(14):
+                indice = dopo.month - 1 + scarto
+                anno, mese = dopo.year + indice // 12, indice % 12 + 1
+                giorno = min(int(ripeti["giorno"]), calendar.monthrange(anno, mese)[1])  # mese corto: l'ultimo giorno
+                quando = datetime.combine(date(anno, mese, giorno), ora)
+                if quando > dopo:
+                    return quando
+            return None
+        if tipo not in ("giorno", "settimana"):
+            return None
+        giorni = ripeti["giorni"] if tipo == "settimana" else range(7)
+        for scarto in range(8):
+            giorno = dopo.date() + timedelta(days=scarto)
+            quando = datetime.combine(giorno, ora)
+            if giorno.weekday() in giorni and quando > dopo:
+                return quando
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def pulisci_ripeti(ripeti) -> dict:
+    """Controlla e normalizza «ripeti» come arriva dal browser; ValueError con il motivo in italiano."""
+    if not isinstance(ripeti, dict) or ripeti.get("tipo") not in TIPI_RIPETI:
+        raise ValueError("Scegli ogni quanto ripetere l'attività")
+    try:
+        ora = datetime.strptime(str(ripeti.get("ora", "")).strip(), "%H:%M")
+    except ValueError:
+        raise ValueError("L'ora va scritta come HH:MM, per esempio 09:30") from None
+    pulito = {"tipo": ripeti["tipo"], "ora": f"{ora:%H:%M}"}
+    if pulito["tipo"] == "settimana":
+        giorni = ripeti.get("giorni")
+        if not isinstance(giorni, list) or not giorni or not all(isinstance(g, int) and 0 <= g <= 6 for g in giorni):
+            raise ValueError("Scegli almeno un giorno della settimana")
+        pulito["giorni"] = sorted(set(giorni))
+    elif pulito["tipo"] == "mese":
+        giorno = ripeti.get("giorno")
+        if not isinstance(giorno, int) or isinstance(giorno, bool) or not 1 <= giorno <= 31:
+            raise ValueError("Il giorno del mese va da 1 a 31")
+        pulito["giorno"] = giorno
+    elif pulito["tipo"] == "una":
+        try:
+            pulito["data"] = date.fromisoformat(str(ripeti.get("data", ""))).isoformat()
+        except ValueError:
+            raise ValueError("Scegli la data") from None
+    return pulito
+
+
+def iso(quando: datetime | None) -> str | None:
+    return quando.isoformat(timespec="seconds") if quando else None
+
+
+def giorno_in_parole(quando: datetime) -> str:
+    return f"{GIORNI[quando.weekday()]} {quando:%d/%m/%Y} {quando:%H:%M}"
+
+
+def leggi_programmate() -> list[dict]:
+    try:
+        dati = json.loads(FILE_PROGRAMMATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [a for a in dati if isinstance(a, dict) and a.get("id")] if isinstance(dati, list) else []
+
+
+def scrivi_programmate(elenco: list[dict]) -> None:
+    """Scrittura atomica: un file temporaneo e poi replace, così un arresto a metà non lascia un file rotto."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    temporaneo = FILE_PROGRAMMATE.with_suffix(".json.tmp")
+    temporaneo.write_text(json.dumps(elenco, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporaneo, FILE_PROGRAMMATE)
+
+
+def trova_programmata(elenco: list[dict], pid: str) -> dict:
+    voce = next((a for a in elenco if a["id"] == pid), None)
+    if not voce:
+        raise HTTPException(404, "Attività non trovata")
+    return voce
+
+
+def vista_programmata(a: dict) -> dict:
+    return {**a, "in_esecuzione": a["id"] in IN_ESECUZIONE}
+
+
+@app.get("/api/attivita")
+async def elenco_attivita():
+    return [vista_programmata(a) for a in await asyncio.to_thread(leggi_programmate)]
+
+
+@app.post("/api/attivita")
+async def salva_attivita(request: Request):
+    dati = await request.json()
+    nome, testo = str(dati.get("nome") or "").strip()[:80], str(dati.get("testo") or "").strip()
+    if not nome:
+        raise HTTPException(400, "Scrivi un nome per l'attività")
+    if not testo:
+        raise HTTPException(400, "Scrivi cosa deve fare Claude")
+    progetto = cartella_progetto(str(dati.get("progetto") or "")).name
+    modello = dati.get("modello") or MODELLO_PROGRAMMATE
+    if modello not in MODELLI:
+        raise HTTPException(400, "Modello non valido")
+    try:
+        ripeti = pulisci_ripeti(dati.get("ripeti"))
+    except ValueError as errore:
+        raise HTTPException(400, str(errore)) from None
+    prossima = prossima_esecuzione(ripeti, datetime.now())
+    if prossima is None:
+        raise HTTPException(400, "Questa data e quest'ora sono già passate")
+    async with BLOCCO_PROGRAMMATE:
+        elenco = leggi_programmate()
+        if dati.get("id"):
+            voce = trova_programmata(elenco, str(dati["id"]))
+        else:
+            voce = {"id": uuid.uuid4().hex[:8], "attiva": True, "ultima": None, "esiti": []}
+            elenco.append(voce)
+        voce.update(nome=nome, progetto=progetto, testo=testo, modello=modello, ripeti=ripeti)
+        if ripeti["tipo"] == "una" and voce.get("ultima") and not voce["attiva"]:
+            voce["attiva"] = True  # una volta sola già fatta: con una nuova data si può riprogrammare
+        voce["prossima"] = iso(prossima) if voce["attiva"] else None
+        scrivi_programmate(elenco)
+    return vista_programmata(voce)
+
+
+@app.post("/api/attivita/{pid}/pausa")
+async def pausa_attivita(pid: str):
+    async with BLOCCO_PROGRAMMATE:
+        elenco = leggi_programmate()
+        voce = trova_programmata(elenco, pid)
+        voce.update(attiva=False, prossima=None)
+        scrivi_programmate(elenco)
+    return vista_programmata(voce)
+
+
+@app.post("/api/attivita/{pid}/riprendi")
+async def riprendi_attivita(pid: str):
+    async with BLOCCO_PROGRAMMATE:
+        elenco = leggi_programmate()
+        voce = trova_programmata(elenco, pid)
+        prossima = prossima_esecuzione(voce["ripeti"], datetime.now())
+        if prossima is None:
+            raise HTTPException(400, "La data è già passata: modifica l'attività")
+        voce.update(attiva=True, prossima=iso(prossima))
+        scrivi_programmate(elenco)
+    return vista_programmata(voce)
+
+
+@app.post("/api/attivita/{pid}/esegui")
+async def esegui_attivita(pid: str):
+    trova_programmata(await asyncio.to_thread(leggi_programmate), pid)
+    if not avvia_programmata(pid):
+        raise HTTPException(409, "L'attività è già in esecuzione")
+    return {"ok": True}
+
+
+@app.delete("/api/attivita/{pid}")
+async def elimina_attivita(pid: str):
+    async with BLOCCO_PROGRAMMATE:
+        elenco = leggi_programmate()
+        trova_programmata(elenco, pid)
+        scrivi_programmate([a for a in elenco if a["id"] != pid])
+    return {"ok": True}
+
+
+def avvia_programmata(pid: str, nota: str = "") -> bool:
+    """Fa partire l'attività in background. False se sta già lavorando: la stessa non parte due volte insieme."""
+    if pid in IN_ESECUZIONE:
+        return False
+    IN_ESECUZIONE.add(pid)
+    compito = asyncio.create_task(esegui_programmata(pid, nota))
+    COMPITI_PROGRAMMATE.add(compito)
+    compito.add_done_callback(COMPITI_PROGRAMMATE.discard)
+    return True
+
+
+async def rinomina_programmata(chat: Chat, titolo: str, tentativi: int) -> bool:
+    """Il session_id arriva dopo l'avvio e il file della chat poco più tardi: si riprova per un po'."""
+    for _ in range(tentativi):
+        if chat.sid:
+            try:
+                await asyncio.to_thread(rename_session, chat.sid, titolo, str(chat.lavoro))
+                return True
+            except Exception:
+                pass
+        await asyncio.sleep(2)
+    return False
+
+
+async def lavora_programmata(a: dict, quando: datetime, nota: str) -> tuple[str | None, bool, float, str]:
+    """Una chat nuova nel progetto, senza spettatori. Ritorna (sessione, ok, costo, nota)."""
+    intestazione = f"Attività programmata «{a['nome']}» ({giorno_in_parole(quando)})" + (f". {nota}" if nota else "") + "."
+    messaggio = (f"{intestazione}\n\n{a['testo']}\n\nLavori senza nessuno al computer: non fare domande, "
+                 "decidi in modo prudente e alla fine scrivi un riassunto breve di cosa hai fatto.")
+    titolo = f"⏰ {a['nome']} – {quando:%d/%m %H:%M}"
+    chiave_chat = uuid.uuid4().hex
+    chat = rinomina = None
+    try:
+        chat = Chat(a["progetto"], None, chiave_chat, a.get("modello") or MODELLO_PROGRAMMATE, "auto")
+        chat.programmata = True
+        chat.esito = asyncio.get_running_loop().create_future()
+        CHAT[chiave_chat] = chat
+        await chat.avvia()
+        await chat.messaggio(messaggio, [], True)
+        rinomina = asyncio.create_task(rinomina_programmata(chat, titolo, 60))
+        try:
+            risultato = await asyncio.wait_for(chat.esito, DURATA_MASSIMA_PROGRAMMATA_ORE * 3600)
+        except asyncio.TimeoutError:
+            await chat.chiudi()
+            return chat.sid, False, chat.costo or 0.0, "Ci ha messo troppo: l'ho fermata"
+        rinomina.cancel()
+        await rinomina_programmata(chat, titolo, 1)
+        if risultato is None:
+            return chat.sid, False, chat.costo or 0.0, "La chat si è interrotta"
+        if risultato.is_error:
+            return chat.sid, False, chat.costo or 0.0, spiega_errore(risultato.result or risultato.subtype)
+        return chat.sid, True, chat.costo or 0.0, nota
+    except Exception as errore:
+        if chat and not chat.chiusa:
+            await chat.chiudi()
+        motivo = errore.detail if isinstance(errore, HTTPException) else f"{type(errore).__name__}: {errore}"
+        return (chat.sid if chat else None), False, (chat.costo or 0.0) if chat else 0.0, motivo
+    finally:
+        if rinomina:
+            rinomina.cancel()
+
+
+async def esegui_programmata(pid: str, nota: str = "") -> None:
+    try:
+        a = next((x for x in await asyncio.to_thread(leggi_programmate) if x["id"] == pid), None)
+        if not a:
+            return
+        ATTIVITA["ultima"] = time.monotonic()
+        quando = datetime.now()
+        sessione, ok, costo, nota_esito = await lavora_programmata(a, quando, nota)
+        esito = {"quando": iso(quando), "sessione": sessione, "ok": ok, "costo": round(costo, 4), "nota": nota_esito}
+        async with BLOCCO_PROGRAMMATE:
+            elenco = leggi_programmate()
+            voce = next((x for x in elenco if x["id"] == pid), None)
+            if voce:
+                voce["ultima"] = iso(quando)
+                voce["esiti"] = [*(voce.get("esiti") or []), esito][-ESITI_TENUTI:]
+                scrivi_programmate(elenco)
+        if ok:
+            avviso = f"⏰ {a['nome']}: fatto"
+        else:
+            avviso = f"⏰ {a['nome']}: errore — {' '.join((nota_esito or 'motivo sconosciuto').split()[:12])}"
+        await asyncio.to_thread(avvisa_telefono, avviso)
+    finally:
+        IN_ESECUZIONE.discard(pid)
+        ATTIVITA["ultima"] = time.monotonic()
+
+
+async def avvia_scadute() -> None:
+    """Le attività attive con la prossima esecuzione passata partono: una volta sola, anche se ne hanno
+    saltate più d'una. La prossima si ricalcola da adesso."""
+    adesso = datetime.now()
+    da_avviare = []
+    async with BLOCCO_PROGRAMMATE:
+        elenco = leggi_programmate()
+        for a in elenco:
+            if not a.get("attiva") or not a.get("prossima") or a["id"] in IN_ESECUZIONE:
+                continue
+            try:
+                prevista = datetime.fromisoformat(a["prossima"])
+            except ValueError:
+                continue
+            if prevista > adesso:
+                continue
+            nota = ""
+            if (adesso - prevista).total_seconds() > TOLLERANZA_RITARDO_SECONDI:
+                nota = f"Era prevista per {giorno_in_parole(prevista)}, eseguita adesso"
+            prossima = prossima_esecuzione(a["ripeti"], adesso)
+            a["prossima"] = iso(prossima)
+            if prossima is None:  # una volta sola: fatta
+                a["attiva"] = False
+            da_avviare.append((a["id"], nota))
+        if da_avviare:
+            scrivi_programmate(elenco)
+    for pid, nota in da_avviare:
+        avvia_programmata(pid, nota)
+
+
+async def pianificatore() -> None:
+    while True:
+        try:
+            await avvia_scadute()
+        except Exception:
+            pass  # un file illeggibile non deve fermare il controllo successivo
+        await asyncio.sleep(CONTROLLO_PROGRAMMATE_SECONDI)
 
 
 @app.websocket("/ws")

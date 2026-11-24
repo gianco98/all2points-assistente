@@ -49,6 +49,13 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
 - **Anteprima:** il bottone «Anteprima» in alto apre un pannello a destra con le pagine web (.html) e le immagini (.png, .jpg, .gif, .webp, .svg) che Claude crea nella chat; si apre da solo alla prima. Si vedono solo file della cartella del progetto. Per un sito già acceso sul tuo computer (es. `http://localhost:3000`) scrivi l'indirizzo nel campo e premi «Apri».
 - **Versione:** è indicata in basso a sinistra.
 
+## Attività programmate
+- In basso a sinistra, il bottone **Attività** apre l'elenco e il modulo «Nuova attività»: scegli nome, progetto, cosa deve fare Claude, il modello e quando (ogni giorno, ogni settimana nei giorni che vuoi, ogni mese, una volta sola) con l'ora. Nell'elenco puoi mettere in **Pausa**, **Eseguire ora**, **Modificare** o **Eliminare**, e con «apri» vedi la chat dell'ultima esecuzione.
+- Ogni esecuzione è una chat nuova nel progetto, con i permessi automatici, chiamata «⏰ nome – gg/mm hh:mm». Claude lavora senza fare domande e alla fine scrive un riassunto.
+- A fine lavoro arriva un avviso sul telefono: «⏰ nome: fatto» oppure «⏰ nome: errore — motivo» (vedi gli avvisi nelle Impostazioni).
+- **Limite:** partono solo con il motore acceso, e il motore si spegne dopo 20 minuti senza finestre aperte. Se all'ora giusta era spento (o il computer dormiva), l'attività parte **una volta sola** al primo avvio successivo, con la nota «Era prevista per…»; le occorrenze saltate non si recuperano. Un'attività al lavoro tiene acceso il motore.
+- Le attività sono salvate nel file `attivita.json` nella cartella `All2Points Assistente`, solo su questo computer.
+
 ## Browser
 - **Chrome separato:** ha il suo profilo; i login si fanno una volta in quella finestra.
 - **Il mio Chrome:** Claude lavora nel tuo Chrome con i login che hai già.
