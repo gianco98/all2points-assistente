@@ -11,11 +11,12 @@ const el = {
   main: $('main'), permessi: $('#permessi'), collegamento: $('#collegamento'), velo: $('#velo-lato'),
   menuModello: $('#menu-modello'), menuPermessi: $('#menu-permessi'), popStrumenti: $('#pop-strumenti'),
   apriStrumenti: $('#apri-strumenti'), strumentiConto: $('#strumenti-conto'), versione: $('#versione'),
+  agentiBarra: $('#agenti-barra'),
 };
 
 // storicoInCorso: la cronologia della chat si sta caricando via HTTP; gli eventi dal vivo aspettano (buffer) per non finire cancellati.
 // attaccato: la vista è in fondo, quindi i nuovi messaggi la fanno scorrere.
-let stato = { progetto: null, sessione: null, chiave: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null, inCorso: [], apertura: 0, storicoInCorso: false, buffer: [], attaccato: true, nuovi: false, elenchi: {}, costoTesto: '', contestoTesto: '' };
+let stato = { progetto: null, sessione: null, chiave: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null, inCorso: [], inizio: 0, scarto: 0, cosa: '', agenti: new Map(), apertura: 0, storicoInCorso: false, buffer: [], attaccato: true, nuovi: false, elenchi: {}, costoTesto: '', contestoTesto: '' };
 const TITOLO = 'Assistente All2Points';
 const icona = (nome, classe = '') => `<svg class="ic ${classe}" aria-hidden="true"><use href="#i-${nome}"/></svg>`;
 
@@ -169,9 +170,109 @@ function indicatore(acceso) {
   el.messaggi.querySelector('.vuoto')?.remove();
   const d = document.createElement('div');
   d.className = 'lavoro';
-  d.innerHTML = '<i></i><i></i><i></i><span class="sr">Claude sta lavorando</span>';
+  d.innerHTML = '<i></i><i></i><i></i><span class="sr">Claude sta lavorando</span><span class="lavoro-testo" aria-hidden="true"></span>';
   el.messaggi.append(d);
+  aggiornaRiga();
   scorri();
+}
+
+// ---- tempo di lavoro: l'inizio lo dà il motore (ora del suo orologio), il conteggio lo fa la pagina con un solo timer ----
+const adesso = () => Date.now() + stato.scarto;
+const secondiDa = (inizio) => Math.max(0, Math.floor((adesso() - inizio) / 1000));
+function tempoLungo(s) {
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${s / 60} min`;
+  return `${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')} min`;
+}
+function tempoBreve(s) {
+  if (s < 3600) return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+// Un elemento con data-inizio si aggiorna da solo a ogni secondo.
+function segnaTempo(nodo, inizio) {
+  if (!nodo) return;
+  if (!inizio) { delete nodo.dataset.inizio; nodo.textContent = ''; return; }
+  nodo.dataset.inizio = inizio;
+  nodo.textContent = tempoBreve(secondiDa(inizio));
+}
+const COSA_STRUMENTO = {
+  Bash: 'sta eseguendo un comando', Read: 'sta leggendo un file', Write: 'sta scrivendo un file', Edit: 'sta modificando un file',
+  Glob: 'sta cercando dei file', Grep: 'sta cercando nei file', WebSearch: 'sta cercando sul web', WebFetch: 'sta leggendo una pagina web',
+  Skill: 'sta usando una skill',
+};
+function cosaStrumento(nome) {
+  if (nome?.startsWith('mcp__')) return 'sta usando un connettore';
+  return COSA_STRUMENTO[nome] || 'sta lavorando';
+}
+function cosaAdesso() {
+  for (const a of stato.agenti.values()) if (a.stato === 'lavora' && !a.sfondo) return 'aspetta gli agenti';
+  return stato.cosa || 'sta pensando';
+}
+function aggiornaRiga() {
+  const nodo = el.messaggi.querySelector('.lavoro-testo');
+  if (!nodo) return;
+  const t = `${stato.inizio ? `Al lavoro da ${tempoLungo(secondiDa(stato.inizio))}` : 'Al lavoro'} · ${cosaAdesso()}`;
+  if (nodo.textContent !== t) nodo.textContent = t;
+}
+setInterval(() => {
+  document.querySelectorAll('[data-inizio]').forEach((n) => {
+    const t = tempoBreve(secondiDa(Number(n.dataset.inizio)));
+    if (n.textContent !== t) n.textContent = t;
+  });
+  aggiornaRiga();
+}, 1000);
+const inizioChat = (progetto, sessione) => stato.inCorso.find((x) => x.progetto === progetto && x.sessione === sessione)?.inizio || 0;
+
+// ---- agenti: un riquadro per ognuno, aggiornato sul posto ----
+const STATO_AGENTE = { lavora: 'Al lavoro', fatto: 'Finito', fermato: 'Fermato', errore: 'Non riuscito' };
+function aggiornaBarraAgenti() {
+  const n = [...stato.agenti.values()].filter((a) => a.stato === 'lavora').length;
+  el.agentiBarra.hidden = !n;
+  el.agentiBarra.querySelector('.ab-testo').textContent = `${n} ${n === 1 ? 'agente' : 'agenti'} al lavoro`;
+}
+function disegnaAgente(a) {
+  stato.agenti.set(a.id, a);
+  let nodo = [...el.messaggi.querySelectorAll('.agente')].find((x) => x.dataset.id === a.id);
+  const nuovo = !nodo;
+  if (nuovo) {
+    el.messaggi.querySelector('.vuoto')?.remove();
+    nodo = document.createElement('div');
+    nodo.dataset.id = a.id;
+    nodo.innerHTML = `<div class="ag-testa"><span class="ag-icona" aria-hidden="true"></span><strong class="ag-nome"></strong>
+      <span class="ag-meta"><span class="ag-stato"></span><span class="ag-tempo" aria-hidden="true"></span><span class="ag-azioni"></span></span></div><div class="ag-esito"></div>`;
+    indicatore(false);
+    el.messaggi.append(nodo);
+    stato.bolla = null;
+  }
+  nodo.className = `agente ${a.stato}`;
+  nodo.querySelector('.ag-icona').innerHTML = a.stato === 'lavora' ? '<i class="ag-anello"></i>' : icona(a.stato === 'fatto' ? 'spunta' : 'x');
+  nodo.querySelector('.ag-nome').textContent = a.nome;
+  nodo.querySelector('.ag-stato').textContent = STATO_AGENTE[a.stato] + (a.sfondo && a.stato === 'lavora' ? ' in background' : '');
+  segnaTempo(nodo.querySelector('.ag-tempo'), a.stato === 'lavora' ? a.inizio : 0);
+  if (a.stato !== 'lavora' && a.fine) nodo.querySelector('.ag-tempo').textContent = tempoBreve(Math.max(0, Math.round((a.fine - a.inizio) / 1000)));
+  nodo.querySelector('.ag-azioni').textContent = `${a.azioni} ${a.azioni === 1 ? 'azione' : 'azioni'}`;
+  const esito = nodo.querySelector('.ag-esito');
+  if (a.riassunto && esito.dataset.r !== a.riassunto) {
+    esito.dataset.r = a.riassunto;
+    const prima = a.riassunto.split('\n').find((r) => r.trim())?.trim() || '';
+    if (prima.length <= 140 && prima === a.riassunto.trim()) {  // una riga sola: si legge subito, non c'è nulla da aprire
+      const p = document.createElement('p');
+      p.className = 'ag-riga';
+      p.textContent = prima;
+      esito.replaceChildren(p);
+    } else {
+      const d = document.createElement('details');
+      const s = document.createElement('summary');
+      s.textContent = prima.length > 140 ? `${prima.slice(0, 137)}…` : prima;
+      const corpo = document.createElement('div');
+      corpo.className = 'ag-corpo';
+      corpo.innerHTML = markdown(a.riassunto);
+      d.append(s, corpo);
+      esito.replaceChildren(d);
+    }
+  }
+  aggiornaBarraAgenti();
+  if (nuovo) { scorri(); if (stato.lavoro) indicatore(true); }
 }
 function vuoto() {
   const nome = window.nomeUtente ? `, ${esc(window.nomeUtente)}` : '';
@@ -190,7 +291,9 @@ function segniInCorso() {
   const qui = stato.inCorso.filter((x) => x.progetto === stato.progetto);
   el.elenco.querySelectorAll('a').forEach((a) => {
     const lavora = a.dataset.sid ? qui.some((x) => x.sessione === a.dataset.sid) : false;
-    a.classList.toggle('in-corso', lavora || (a.dataset.corrente === '1' && stato.lavoro));
+    const questa = a.dataset.corrente === '1' && stato.lavoro;
+    a.classList.toggle('in-corso', lavora || questa);
+    segnaTempo(a.querySelector('.tempo'), lavora || questa ? (a.dataset.sid && inizioChat(stato.progetto, a.dataset.sid)) || (questa ? stato.inizio : 0) : 0);
   });
   const progetti = new Set(stato.inCorso.map((x) => x.progetto));
   for (const o of el.progetto.options) o.text = o.dataset.base + (progetti.has(o.value) ? ' ●' : '');
@@ -480,6 +583,13 @@ const schede = {
         tab.append(punto);
       }
       tab.append(titolo);
+      if (lavora) {
+        const tempo = document.createElement('span');
+        tempo.className = 'sc-tempo';
+        tempo.setAttribute('aria-hidden', 'true');
+        segnaTempo(tempo, (s.sessione && inizioChat(s.progetto, s.sessione)) || (s === this.attiva ? stato.inizio : 0));
+        tab.append(tempo);
+      }
       if (this.piuProgetti()) tab.append(progetto);  // il nome del progetto serve solo se le schede ne mescolano più d'uno
       tab.addEventListener('click', () => { if (s !== this.attiva) vaiA(s.progetto, s.sessione, s.titolo, s.chiave); });
       const x = document.createElement('button');
@@ -578,6 +688,7 @@ function ricevi(m) {
   if (stato.storicoInCorso && !SENZA_ATTESA.includes(m.tipo)) { stato.buffer.push(m); return; }
   switch (m.tipo) {
     case 'in_corso':
+      if (m.chat.length && m.chat[0].ora) stato.scarto = m.chat[0].ora - Date.now();
       stato.inCorso = m.chat;
       schede.sincronizza(m.chat);
       segniInCorso();
@@ -586,6 +697,8 @@ function ricevi(m) {
       // Appena aperta, la chat dice «ferma» prima di ricevere il messaggio mandato in quel momento: non è vero.
       if (!m.si && stato.mandatoInApertura) { stato.mandatoInApertura = false; break; }
       stato.mandatoInApertura = false;
+      if (m.ora) stato.scarto = m.ora - Date.now();
+      if (m.si) { stato.inizio = m.inizio || stato.inizio; if (!stato.lavoro) stato.cosa = ''; } else stato.cosa = '';
       inLavoro(m.si);
       break;
     case 'coda':
@@ -640,6 +753,7 @@ function ricevi(m) {
       }
       break;
     case 'testo':
+      stato.cosa = 'sta scrivendo la risposta';
       indicatore(false);
       if (!stato.bolla) { stato.bolla = aggiungi('msg claude', ''); stato.bolla.dataset.md = ''; }
       stato.bolla.dataset.md += m.testo;
@@ -647,12 +761,17 @@ function ricevi(m) {
       scorri();
       break;
     case 'strumento':
+      stato.cosa = cosaStrumento(m.nome);
       stato.bolla = null;
       indicatore(false);
       aggiungiStrumento(m.testo, m.sotto);
       indicatore(true);
       break;
+    case 'agente':
+      disegnaAgente(m);
+      break;
     case 'passi': {
+      stato.cosa = 'sta aggiornando i passi';
       indicatore(false);
       const nuovo = !stato.passi;
       stato.passi = disegnaPassi(m.passi, stato.passi);
@@ -665,12 +784,14 @@ function ricevi(m) {
       fileAnteprima(m.percorso, true);
       break;
     case 'permesso':
+      stato.cosa = 'aspetta il tuo permesso';
       indicatore(false);
       mostraPermesso(m);
       break;
     case 'fine':
       stato.bolla = null;
       inLavoro(m.lavora);
+      if (!m.lavora && m.durata >= 5) aggiungi('lavorato', `Ha lavorato per ${tempoLungo(m.durata)}`);
       if (m.errore) aggiungi('msg claude errore', m.errore);
       if (m.errore?.startsWith('La chiave API')) $('#dlg-impostazioni').showModal();
       mostraCosto(m.costo);
@@ -704,6 +825,7 @@ function mostraPermesso(m) {
     nodo.classList.add('risolto');
     nodo.querySelectorAll('button').forEach((x) => (x.disabled = true));
     nodo.querySelector('.dettaglio').textContent += b.dataset.r === 'no' ? ' — negato' : ' — consentito';
+    stato.cosa = 'sta lavorando';
     indicatore(true);
   }));
   el.messaggi.append(nodo);
@@ -783,7 +905,7 @@ async function caricaChat() {
     const a = document.createElement('a');
     a.href = '#';
     a.title = c.titolo;
-    a.innerHTML = `<span></span><i class="punto" aria-hidden="true"></i>`;
+    a.innerHTML = `<span></span><small class="tempo" aria-hidden="true"></small><i class="punto" aria-hidden="true"></i>`;
     a.querySelector('span').textContent = c.titolo;
     if (c.provvisoria) {
       a.className = stato.lavoro ? 'in-corso' : '';
@@ -871,6 +993,10 @@ async function apriChat(sid, titolo, chiave) {
   ultimaChat.salva(stato.progetto, sid);
   stato.bolla = null;
   stato.passi = null;
+  stato.agenti.clear();
+  aggiornaBarraAgenti();
+  stato.inizio = 0;
+  stato.cosa = '';
   stato.pronto = false;
   stato.buffer = [];
   stato.storicoInCorso = !!sid;
@@ -998,6 +1124,8 @@ el.form.addEventListener('submit', (e) => {
     }
     stato.bolla = null;
     stato.passi = null;
+    stato.inizio = adesso();  // provvisorio: il motore manda poi l'ora esatta di inizio
+    stato.cosa = '';
     inLavoro(true);
     if (stato.titoloProvvisorio && !stato.sessione) caricaChat();
   }

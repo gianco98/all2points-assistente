@@ -409,3 +409,41 @@ dialog .azioni { padding: 12px 24px 16px; border-top: 1px solid var(--bordo); }
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
   .scheda.finita { background: var(--accento-tenue); }
 }
+
+/* ---- tempo di lavoro e agenti ---- */
+.lavoro { gap: 4px; }
+.lavoro-testo { margin-left: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.lavorato { align-self: flex-start; font-size: 12px; color: var(--tenue); font-variant-numeric: tabular-nums; margin-top: -4px; }
+#chat-elenco a .tempo { display: none; flex: none; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--accento); }
+#chat-elenco a.in-corso .tempo:not(:empty) { display: block; }
+#chat-elenco a:hover .tempo, #chat-elenco a:focus-within .tempo, #chat-elenco a:focus-visible .tempo { display: none !important; }
+.scheda .sc-tempo { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--accento); }
+.scheda .sc-tab > span:not(.sc-punto):not(.sc-progetto):not(.sc-tempo) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agenti-barra { flex: none; display: inline-flex; align-items: center; gap: 8px; min-height: 28px; padding: 0 12px; border-radius: 14px; background: var(--accento-tenue); color: var(--accento); font-size: 13px; font-weight: 500; }
+.agenti-barra[hidden] { display: none; }
+.ab-punto { width: 8px; height: 8px; border-radius: 50%; background: var(--accento); animation: pulsa 1.6s ease-in-out infinite; }
+
+.agente { align-self: stretch; padding: 12px 16px; border: 1px solid var(--bordo); border-radius: 12px; font-size: 14px; }
+.agente.lavora { border-color: var(--accento-bordo); }
+.ag-testa { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; }
+.ag-icona { flex: none; display: grid; place-items: center; width: 18px; height: 18px; }
+.ag-icona .ic { width: 16px; height: 16px; }
+.agente.fatto .ag-icona { color: var(--accento); }
+.agente.fermato .ag-icona, .agente.errore .ag-icona { color: var(--pericolo-testo); }
+.ag-anello { width: 14px; height: 14px; box-sizing: border-box; border-radius: 50%; border: 2px solid var(--accento-bordo); border-top-color: var(--accento); animation: gira 1s linear infinite; }
+@keyframes gira { to { transform: rotate(360deg); } }
+.ag-nome { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ag-meta { flex: none; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--tenue); font-variant-numeric: tabular-nums; }
+.ag-meta > span:not(:empty) + span:not(:empty)::before { content: "·"; margin-right: 8px; }
+.ag-esito:empty { display: none; }
+.ag-esito { margin-top: 8px; }
+.ag-esito summary { cursor: pointer; color: var(--tenue); font-size: 13px; line-height: 1.5; list-style: none; display: flex; gap: 4px; }
+.ag-esito summary::-webkit-details-marker { display: none; }
+.ag-esito summary::before { content: ""; flex: none; width: 6px; height: 6px; margin: 6px 6px 0 2px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); transition: transform var(--veloce); }
+.ag-esito details[open] summary::before { transform: rotate(45deg); }
+.ag-esito summary:hover { color: var(--testo); }
+.ag-corpo { margin-top: 8px; padding-left: 16px; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.ag-corpo p { margin: 0 0 8px; }
+.ag-corpo > :last-child { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .ag-anello, .ab-punto { animation: none; } }
+.ag-riga { margin: 0; font-size: 13px; line-height: 1.5; color: var(--tenue); overflow-wrap: anywhere; }

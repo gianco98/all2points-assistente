@@ -95,6 +95,7 @@ SENZA_CONFERMA = (
 STRUMENTI_TODO = ("TodoWrite",)
 STRUMENTI_FILE = ("Write", "Edit", "MultiEdit")
 ESTENSIONI_ANTEPRIMA = {".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+STRUMENTI_AGENTE = ("Task", "Agent")
 STATI_PASSI = {"completed": "fatto", "in_progress": "in_corso"}
 KEYRING = ("all2points-assistente", "anthropic")
 KEYRING_ESTENSIONE = ("all2points-assistente", "playwright-extension")
@@ -903,6 +904,32 @@ def riga_testo(ruolo: str, testo: str) -> dict:
     return {"ruolo": ruolo, "testo": testo}
 
 
+def testo_risultato(contenuto) -> str:
+    """Il testo di un risultato di strumento (stringa o lista di blocchi)."""
+    if isinstance(contenuto, str):
+        return contenuto.strip()
+    if isinstance(contenuto, list):
+        return "\n".join(str(b.get("text", "")) for b in contenuto if isinstance(b, dict) and b.get("type") == "text").strip()
+    return ""
+
+
+def testo_agente(dati, contenuto) -> str:
+    """Il riassunto di un agente: la sua relazione finale se il motore la dà, altrimenti il testo del risultato."""
+    relazione = None
+    if isinstance(dati, dict):
+        grezza = dati.get("handbackReport") or dati.get("handback_report")
+        relazione = grezza.get("text") if isinstance(grezza, dict) else None
+        if not relazione and isinstance(dati.get("data"), dict):
+            grezza = dati["data"].get("handback_report")
+            relazione = grezza.get("text") if isinstance(grezza, dict) else None
+    testo = relazione or (contenuto if isinstance(contenuto, str) else testo_risultato(contenuto))
+    if not relazione:
+        if "was delivered to you as a message" in testo or "has not reported yet" in testo:
+            return ""
+        testo = re.split(r"\n\s*agentId:|<usage>", testo)[0]
+    return str(testo).strip()
+
+
 def passi_da_todo(dati: dict) -> list[dict]:
     """La lista completa di TodoWrite come la mostra l'interfaccia: testo e stato (fatto, in_corso, da_fare)."""
     passi = []
@@ -987,12 +1014,17 @@ async def a_tutte(**dati) -> None:
     await asyncio.gather(*(f.invia(**dati) for f in list(FINESTRE)))
 
 
+def ora_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def chat_aperte() -> list["Chat"]:
     return list(dict.fromkeys(CHAT.values()))  # una chat può stare sotto due chiavi
 
 
 def elenco_in_corso() -> list[dict]:
-    return [{"progetto": c.nome_progetto, "sessione": c.sid, "chiavi": sorted(c.chiavi)} for c in chat_aperte() if c.lavora]
+    return [{"progetto": c.nome_progetto, "sessione": c.sid, "chiavi": sorted(c.chiavi), "inizio": c.inizio_ms, "ora": ora_ms()}
+            for c in chat_aperte() if c.lavora]
 
 
 async def aggiorna_in_corso() -> None:
@@ -1023,6 +1055,8 @@ class Chat:
         self.ultima = time.monotonic()
         self.lavora = False
         self.inizio = 0.0
+        self.inizio_ms = 0  # quando è iniziato il lavoro in corso (ora del server, ms): il conteggio lo fa l'interfaccia
+        self.agenti: dict[str, dict] = {}  # gli agenti lanciati da Claude (tool_use_id -> riquadro); quelli finiti restano fino al lavoro dopo
         self.inviati: set[str] = set()  # uuid mandati al motore e non ancora letti
         self.coda: list[dict] = []  # messaggi scritti mentre Claude lavora: {id, testo, completo}
         self.dopo_stop: str | None = None  # "stop" o "riparti" (ferma e manda): cosa fare del risultato dell'interruzione
@@ -1168,7 +1202,10 @@ class Chat:
             self._compito(self._invia_contesto())
         if self.connettori:
             await finestra.invia(tipo="connettori", voci=self.connettori)
-        await finestra.invia(tipo="lavora", si=self.lavora)
+        await finestra.invia(tipo="lavora", si=self.lavora, inizio=self.inizio_ms, ora=ora_ms())
+        for a in self.agenti.values():
+            if a["stato"] == "lavora":  # quelli finiti restano nello storico come riga «Sotto-agente»
+                await finestra.invia(tipo="agente", **self._agente_pubblico(a))
         await finestra.invia(tipo="coda", coda=self._coda_visibile())
         for r in list(self.richieste.values()):
             await finestra.invia(**r["evento"])
@@ -1230,15 +1267,54 @@ class Chat:
             await self.invia(tipo="utente", testo=mostrato)
         await self._manda(completo)
 
+    def _inizia_lavoro(self) -> None:
+        self.lavora = True
+        self.inizio = time.monotonic()
+        self.inizio_ms = ora_ms()
+        # I riquadri degli agenti del lavoro di prima spariscono; quelli ancora al lavoro restano.
+        self.agenti = {k: a for k, a in self.agenti.items() if a["stato"] == "lavora"}
+
+    # ----- agenti -----
+
+    @staticmethod
+    def _agente_pubblico(a: dict) -> dict:
+        return {k: v for k, v in a.items() if k not in ("task_id", "progresso")}
+
+    async def _agente_aggiorna(self, a: dict) -> None:
+        await self.invia(tipo="agente", **self._agente_pubblico(a))
+
+    def _trova_agente(self, tool_use_id: str | None = None, task_id: str | None = None) -> dict | None:
+        if tool_use_id and tool_use_id in self.agenti:
+            return self.agenti[tool_use_id]
+        if task_id:
+            return next((a for a in self.agenti.values() if a.get("task_id") == task_id), None)
+        return None
+
+    def _nuovo_agente(self, chiave: str, nome: str, sfondo: bool, task_id: str | None = None) -> dict:
+        a = {"id": chiave, "nome": nome[:120] or "Agente", "sfondo": sfondo, "inizio": ora_ms(), "stato": "lavora",
+             "azioni": 0, "fine": None, "riassunto": "", "task_id": task_id}
+        self.agenti[chiave] = a
+        return a
+
+    async def _chiudi_agente(self, a: dict, stato_finale: str, riassunto: str | None = None) -> None:
+        # Il testo può arrivare dopo la fine (la notifica segue l'aggiornamento di stato): si aggiunge senza cambiare l'esito.
+        nuovo_testo = bool(riassunto) and riassunto[:6000] != a["riassunto"]
+        if a["stato"] == "lavora":
+            a["stato"], a["fine"] = stato_finale, ora_ms()
+        elif not nuovo_testo:
+            return
+        if riassunto:
+            a["riassunto"] = riassunto[:6000]
+        await self._agente_aggiorna(a)
+
     async def _manda(self, completo: str) -> None:
         uid = uuid.uuid4().hex
         self.inviati.add(uid)
         if not self.lavora:
-            self.lavora = True
-            self.inizio = time.monotonic()
+            self._inizia_lavoro()
             self.dopo_stop = None
             await aggiorna_in_corso()
-            await self.invia(tipo="lavora", si=True)
+            await self.invia(tipo="lavora", si=True, inizio=self.inizio_ms, ora=ora_ms())
         try:
             await self.client.query(domanda(completo, uid))
         except Exception:
@@ -1310,19 +1386,38 @@ class Chat:
         figlio = getattr(m, "parent_tool_use_id", None)
         if isinstance(m, TaskStartedMessage):
             self.task_attivi.add(m.task_id)
+            a = self._trova_agente(getattr(m, "tool_use_id", None))
+            if a is None and getattr(m, "task_type", None) in ("local_agent", "local_workflow"):
+                a = self._nuovo_agente(m.task_id, m.description or "Agente", True)
+            if a is not None:
+                a["task_id"] = m.task_id
+                if (getattr(m, "data", None) or {}).get("is_backgrounded"):
+                    a["sfondo"] = True
+                await self._agente_aggiorna(a)
             await aggiorna_in_corso()
+        elif getattr(m, "subtype", None) == "task_progress":
+            a = self._trova_agente(getattr(m, "tool_use_id", None), getattr(m, "task_id", None))
+            usi = (getattr(m, "usage", None) or (getattr(m, "data", None) or {}).get("usage") or {}).get("tool_uses")
+            if a is not None and isinstance(usi, int):
+                a["progresso"] = True
+                a["azioni"] = usi
+                await self._agente_aggiorna(a)
         elif isinstance(m, (TaskNotificationMessage, TaskUpdatedMessage)):
             stato_task = m.status or (m.patch.get("status") if isinstance(m, TaskUpdatedMessage) else None)
-            if stato_task in TERMINAL_TASK_STATUSES and m.task_id in self.task_attivi:
-                self.task_attivi.discard(m.task_id)
-                await aggiorna_in_corso()
-                self.forse_chiudi()
+            if stato_task in TERMINAL_TASK_STATUSES:
+                a = self._trova_agente(getattr(m, "tool_use_id", None), m.task_id)
+                if a is not None:
+                    esito = {"completed": "fatto", "failed": "errore"}.get(stato_task, "fermato")
+                    await self._chiudi_agente(a, esito, testo_agente(getattr(m, "data", None), getattr(m, "summary", None)))
+                if m.task_id in self.task_attivi:
+                    self.task_attivi.discard(m.task_id)
+                    await aggiorna_in_corso()
+                    self.forse_chiudi()
         if not self.lavora and not figlio and isinstance(m, (StreamEvent, AssistantMessage)):
             # Un turno partito da solo (es. un agente in background che ha finito).
-            self.lavora = True
-            self.inizio = time.monotonic()
+            self._inizia_lavoro()
             await aggiorna_in_corso()
-            await self.invia(tipo="lavora", si=True)
+            await self.invia(tipo="lavora", si=True, inizio=self.inizio_ms, ora=ora_ms())
         if isinstance(m, StreamEvent):
             if figlio:
                 return
@@ -1330,19 +1425,35 @@ class Chat:
             if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
                 await self.invia(tipo="testo", testo=ev["delta"]["text"])
         elif isinstance(m, AssistantMessage):
+            agente_padre = self._trova_agente(figlio) if figlio else None
             for b in m.content:
                 if not isinstance(b, ToolUseBlock):
+                    continue
+                if agente_padre is not None:
+                    if not agente_padre.get("progresso"):  # se il motore manda il conteggio, vale quello
+                        agente_padre["azioni"] += 1
+                        await self._agente_aggiorna(agente_padre)
+                    continue
+                if not figlio and b.name in STRUMENTI_AGENTE:
+                    dati = b.input if isinstance(b.input, dict) else {}
+                    nome = dati.get("description") or dati.get("subagent_type") or "Agente"
+                    await self._agente_aggiorna(self._nuovo_agente(b.id, str(nome), bool(dati.get("run_in_background"))))
                     continue
                 if not figlio and b.name in STRUMENTI_TODO:
                     await self.invia(tipo="passi", passi=passi_da_todo(b.input))
                     continue
-                await self.invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(figlio))
+                await self.invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), nome=b.name, sotto=bool(figlio))
                 rel = None if figlio else percorso_anteprima(b.name, b.input, self.lavoro)
                 if rel:
                     self.anteprime[b.id] = rel
         elif isinstance(m, UserMessage) and not figlio and isinstance(m.content, list):
             for b in m.content:
-                if isinstance(b, ToolResultBlock) and not b.is_error and b.tool_use_id in self.anteprime:
+                if not isinstance(b, ToolResultBlock):
+                    continue
+                a = self._trova_agente(b.tool_use_id)
+                if a is not None and (b.is_error or not a["sfondo"]):
+                    await self._chiudi_agente(a, "errore" if b.is_error else "fatto", testo_agente(getattr(m, "tool_use_result", None), b.content))
+                if not b.is_error and b.tool_use_id in self.anteprime:
                     await self.invia(tipo="file_anteprima", percorso=self.anteprime.pop(b.tool_use_id))
         elif isinstance(m, SystemMessage) and m.subtype == "init":
             self._registra_sid(m.data.get("session_id"))
@@ -1368,11 +1479,16 @@ class Chat:
         else:
             self.inviati -= set(letti)
         dopo, self.dopo_stop = self.dopo_stop, None
+        for a in list(self.agenti.values()):
+            # Un agente che non ha più nessuno a cui rispondere (lavoro interrotto): non resta «al lavoro».
+            if a["stato"] == "lavora" and a["task_id"] not in self.task_attivi and not (a["sfondo"] and a["task_id"] is None):
+                await self._chiudi_agente(a, "fermato")
         prossimo = None
         if not self.inviati and dopo is None and not interrotto and self.coda:
             prossimo = self.coda.pop(0)
         resta = bool(self.inviati) or prossimo is not None or dopo == "riparti"
         await self.invia(tipo="fine", costo=self.costo or 0.0, sessione=m.session_id, lavora=resta,
+                         durata=round(time.monotonic() - self.inizio),
                          errore=spiega_errore(m.result or m.subtype) if m.is_error and dopo is None else None,
                          spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
         self.fine_turno.set()
