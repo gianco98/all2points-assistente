@@ -65,6 +65,12 @@ select, input, textarea { background: var(--pannello); border: 1px solid var(--b
 .strumenti span { padding: .2em .6em; border-radius: 99px; background: #1f1f1f; color: #bbb; }
 .strumenti span.ok::before { content: "● "; color: var(--accento); }
 .strumenti span.no::before { content: "○ "; color: #777; }
+.strumenti span.login::before { content: "◐ "; color: #d9a441; }
+.strumenti span button { margin-left: .4em; padding: 0 .5em; border: 0; border-radius: 99px; font: inherit; background: var(--accento); color: #111; cursor: pointer; }
+.strumenti span button:disabled { opacity: .6; cursor: default; }
+.strumenti details { flex-basis: 100%; color: #a8a8a8; }
+.strumenti summary { cursor: pointer; padding: .2em 0; }
+.strumenti details .strumenti { max-height: 30vh; overflow-y: auto; padding-top: .35rem; }
 .spesa { font-size: .82em; color: var(--tenue); }
 #lato .spesa { color: #a8a8a8; }
 

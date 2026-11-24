@@ -469,6 +469,88 @@ def stato_strumenti() -> list[dict]:
     return voci
 
 
+# ---------- connettori con login (Notion, Figma, Canva… dai plugin di Claude Desktop) ----------
+
+# Nomi scritti come li scrivono i servizi; gli altri si ricavano dal nome del server.
+NOMI_SERVIZI = {"hubspot": "HubSpot", "amplitude-eu": "Amplitude EU", "similarweb": "Similarweb",
+                "google calendar": "Google Calendar", "gmail": "Gmail"}
+# Passano dal login di claude.ai: con una chiave API non si collegano.
+SOLO_CLAUDE_AI = re.compile(r"gmail|google calendar", re.I)
+ORDINE_STATI = {"ok": 0, "collego": 1, "login": 2, "attesa": 3, "no": 4, "chiave": 5}
+
+
+def connettori_remoti(stato_mcp: dict) -> list[dict]:
+    """I server MCP remoti (HTTP/SSE) caricati dal motore, uno per servizio, con il loro stato:
+    ok = collegato, login = da collegare, attesa = si sta collegando, no = non disponibile,
+    chiave = non disponibile con la chiave API."""
+    voci: dict[str, dict] = {}
+    for s in stato_mcp.get("mcpServers", []):
+        cfg = s.get("config") or {}
+        if cfg.get("type") not in ("http", "sse"):
+            continue
+        servizio = s["name"].rsplit(":", 1)[-1]
+        if SOLO_CLAUDE_AI.search(servizio):
+            stato = "chiave"
+        else:
+            stato = {"connected": "ok", "needs-auth": "login", "pending": "attesa"}.get(s.get("status"), "no")
+        voce = {"nome": NOMI_SERVIZI.get(servizio, servizio.replace("-", " ").title()),
+                "server": s["name"], "url": cfg.get("url") or "", "stato": stato, "motivo": s.get("error") or ""}
+        # Lo stesso servizio può stare in più plugin: il login vale per indirizzo, si mostra una volta.
+        chiave_voce = voce["url"] or voce["nome"]
+        prima = voci.get(chiave_voce)
+        if not prima or ORDINE_STATI[stato] < ORDINE_STATI[prima["stato"]]:
+            voci[chiave_voce] = voce
+    return sorted(voci.values(), key=lambda v: v["nome"].lower())
+
+
+def cli_claude() -> str | None:
+    """La CLI di Claude Code che l'Agent SDK porta con sé; se manca, quella installata."""
+    import claude_agent_sdk
+    inclusa = Path(claude_agent_sdk.__file__).parent / "_bundled" / ("claude.exe" if WINDOWS else "claude")
+    return str(inclusa) if inclusa.exists() else trova_comando("claude")
+
+
+def cartella_plugin(nome_plugin: str) -> str | None:
+    for p in plugin_desktop():
+        try:
+            dati = json.loads((Path(p["path"]) / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if dati.get("name") == nome_plugin:
+            return p["path"]
+    return None
+
+
+def login_connettore(server: str) -> bool:
+    """Il login OAuth di un server MCP con `claude mcp login`, che apre il browser e salva i token
+    sul computer di chi usa l'app. Vuole un terminale vero: su Windows una console nascosta, su Mac uno pty."""
+    cli = cli_claude()
+    if not cli:
+        return False
+    parti = server.split(":")
+    cartella = cartella_plugin(parti[1]) if parti[0] == "plugin" and len(parti) == 3 else None
+    comando = [cli, *(["--plugin-dir", cartella] if cartella else []), "mcp", "login", server]
+    padre = None
+    if WINDOWS:
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = 0  # nascosta
+        processo = subprocess.Popen(comando, creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=info)
+    else:
+        import pty
+        padre, figlio = pty.openpty()
+        processo = subprocess.Popen(comando, stdin=figlio, stdout=figlio, stderr=figlio, start_new_session=True)
+        os.close(figlio)
+    try:
+        return processo.wait(timeout=300) == 0  # 5 minuti per fare il login nel browser
+    except subprocess.TimeoutExpired:
+        processo.kill()
+        return False
+    finally:
+        if padre is not None:
+            os.close(padre)
+
+
 def istruzioni(progetto: Path, lavoro: Path) -> str:
     cfg = leggi_config()
     collegata = (
@@ -766,8 +848,10 @@ async def sessione(ws: WebSocket):
     await ws.accept()
     ATTIVITA["finestre"] += 1
 
-    stato = {"client": None, "progetto": None, "consentiti": set(), "costo": 0.0, "lavoro": None}
+    stato = {"client": None, "progetto": None, "consentiti": set(), "costo": 0.0, "lavoro": None,
+             "connettori": [], "mcp": {}, "collego": set(), "controllo": None}
     richieste: dict[str, asyncio.Future] = {}
+    compiti: set[asyncio.Task] = set()
 
     async def invia(**dati):
         try:
@@ -795,8 +879,9 @@ async def sessione(ws: WebSocket):
             if not futuro.done():
                 futuro.set_result("no")
         richieste.clear()
-        if stato["lavoro"] and not stato["lavoro"].done():
-            stato["lavoro"].cancel()
+        for compito in (stato["lavoro"], stato["controllo"]):
+            if compito and not compito.done():
+                compito.cancel()
         if stato["client"]:
             try:
                 await stato["client"].disconnect()
@@ -844,6 +929,51 @@ async def sessione(ws: WebSocket):
         await client.connect()
         stato.update(client=client, progetto=cartella, consentiti=set(), costo=0.0)
         await invia(tipo="pronto", davinci=bool(davinci), browser=bool(browser))
+        stato["controllo"] = asyncio.create_task(controlla_connettori(client))
+
+    async def leggi_connettori(client) -> None:
+        stato["mcp"] = await client.get_mcp_status()
+        voci = connettori_remoti(stato["mcp"])
+        for v in voci:
+            if v["server"] in stato["collego"] and v["stato"] != "ok":
+                v["stato"] = "collego"
+        stato["connettori"] = voci
+        await invia(tipo="connettori", voci=voci)
+
+    async def controlla_connettori(client) -> None:
+        """Appena aperta la chat i server remoti si stanno ancora collegando: si guarda per un po'."""
+        for _ in range(8):
+            try:
+                await leggi_connettori(client)
+            except Exception:
+                return
+            if not any(v["stato"] == "attesa" for v in stato["connettori"]):
+                return
+            await asyncio.sleep(4)
+
+    async def collega(server: str) -> None:
+        voce = next((v for v in stato["connettori"] if v["server"] == server and v["stato"] == "login"), None)
+        client = stato["client"]
+        if not voce or not client:
+            return
+        stato["collego"].add(server)
+        await leggi_connettori(client)
+        try:
+            ok = await asyncio.to_thread(login_connettore, server)
+        finally:
+            stato["collego"].discard(server)
+        if ok and stato["client"] is client:
+            # Il login vale per indirizzo: si ricollegano tutti i server con lo stesso servizio.
+            for s in stato["mcp"].get("mcpServers", []):
+                if (s.get("config") or {}).get("url") == voce["url"] and s.get("status") != "connected":
+                    try:
+                        await client.reconnect_mcp_server(s["name"])
+                    except Exception:
+                        pass
+        if stato["client"] is client:
+            await leggi_connettori(client)
+            if not ok:
+                await invia(tipo="errore", testo=f"Collegamento a {voce['nome']} non riuscito o annullato.")
 
     async def esegui(testo: str):
         ATTIVITA["lavori"] += 1
@@ -913,6 +1043,10 @@ async def sessione(ws: WebSocket):
                     await stato["client"].set_permission_mode(PERMESSI.get(dati.get("modo"), "auto"))
                 elif tipo == "modello" and stato["client"]:
                     await stato["client"].set_model(MODELLI.get(dati.get("modello"), MODELLI["opus"]))
+                elif tipo == "collega" and stato["client"]:
+                    compito = asyncio.create_task(collega(str(dati.get("server", ""))))
+                    compiti.add(compito)  # un compito senza riferimenti può sparire a metà
+                    compito.add_done_callback(compiti.discard)
                 elif tipo == "permesso":
                     futuro = richieste.pop(dati.get("id"), None)
                     if futuro and not futuro.done():

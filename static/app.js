@@ -112,6 +112,10 @@ function ricevi(m) {
       stato.pronto = true;
       for (const d of stato.inAttesa.splice(0)) invia(d);
       break;
+    case 'connettori':
+      stato.connettori = m.voci;
+      mostraStrumenti();
+      break;
     case 'sessione':
       if (m.id && m.id !== stato.sessione) {
         stato.sessione = m.id;
@@ -368,16 +372,62 @@ async function caricaStato() {
   $('#permessi').value = s.permessi;
   el.spesaMese.textContent = `Speso questo mese: ${dollari(s.spesa_mese)}`;
   $('#versione').textContent = `Versione ${s.versione}`;
-  const t = s.strumenti;
+  stato.strumenti = s.strumenti;
+  mostraStrumenti();
+  return s;
+}
+
+// Strumenti trovati sul computer + connettori con login (stato dal vivo della chat aperta).
+const STATI_CONNETTORE = {
+  ok: ['ok', 'Collegato'],
+  login: ['login', 'Da collegare: premi Collega e fai il login nel browser'],
+  collego: ['login', 'Login in corso nel browser…'],
+  attesa: ['no', 'Si sta collegando…'],
+  no: ['no', 'Non disponibile'],
+  chiave: ['no', 'Non disponibile con la chiave API'],
+};
+function mostraStrumenti() {
   // I nomi vengono dalle configurazioni di chi usa l'app: si mettono come testo, non come HTML.
-  el.strumenti.replaceChildren(...t.map(({ nome, ok }) => {
+  const base = (stato.strumenti || []).map(({ nome, ok }) => {
     const voce = document.createElement('span');
     voce.className = ok ? 'ok' : 'no';
     voce.title = ok ? 'Collegato' : 'Non disponibile su questo computer';
     voce.textContent = nome;
     return voce;
-  }));
-  return s;
+  });
+  const connettori = (stato.connettori || []).map((c) => {
+    const [classe, titolo] = STATI_CONNETTORE[c.stato] || STATI_CONNETTORE.no;
+    const voce = document.createElement('span');
+    voce.className = classe;
+    voce.title = c.motivo && c.stato === 'no' ? `${titolo}: ${c.motivo}` : titolo;
+    voce.textContent = c.nome;
+    if (c.stato === 'login' || c.stato === 'collego') {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = c.stato === 'collego' ? 'Collego…' : 'Collega';
+      b.disabled = c.stato === 'collego';
+      b.addEventListener('click', () => invia({ tipo: 'collega', server: c.server }));
+      voce.append(b);
+    }
+    return voce;
+  });
+  // Quelli da collegare o non disponibili stanno in una riga che si apre: l'elenco delle chat deve restare visibile.
+  const collegati = connettori.filter((v) => v.className === 'ok');
+  const altri = connettori.filter((v) => v.className !== 'ok');
+  const voci = [...base, ...collegati];
+  if (altri.length) {
+    const d = document.createElement('details');
+    d.open = stato.altriAperti || altri.some((v) => v.querySelector('button:disabled'));
+    d.addEventListener('toggle', () => (stato.altriAperti = d.open));
+    const s = document.createElement('summary');
+    s.textContent = `Altri connettori (${altri.length})`;
+    const lista = document.createElement('div');
+    lista.className = 'strumenti';
+    lista.append(...altri);
+    d.append(s, lista);
+    voci.push(d);
+  }
+  el.strumenti.replaceChildren(...voci);
 }
 el.modello.addEventListener('change', () => (el.modello.dataset.toccato = '1'));
 

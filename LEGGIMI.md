@@ -55,9 +55,10 @@ L'app li cerca a ogni avvio **sul computer di chi la usa**: ognuno ha i suoi, ne
 - **Skill:** quelle in `~/.claude/skills`, i plugin di Claude Code e i plugin del tuo Claude Desktop (es. montaggio-davinci, meta-ads, pdf, docx). Restano fuori le poche skill che funzionano solo dentro Desktop.
 - **Connettori di Claude Code:** i server MCP registrati per l'utente in Claude Code, es. **Roblox Studio** (Studio aperto) e agent-desktop.
 - **Estensioni di Claude Desktop:** quelle attive, es. **DaVinci** e **Blender** (con Blender aperto e l'addon collegato). Valgono le versioni di Desktop per Mac, per Windows e del Microsoft Store.
-- **Non ci sono** i connettori dell'account claude.ai (Gmail, Drive, Calendar, Canva…): passano dal login di claude.ai e non funzionano con una chiave API.
+- **Connettori con login dei plugin di Claude Desktop** (Notion, Figma, Canva, Slack, Asana, HubSpot…): in basso a sinistra hanno lo stato (● collegato, ◐ da collegare, ○ non disponibile). Su quelli da collegare premi **«Collega»**: si apre il browser, fai il login al servizio e il connettore si attiva nella chat aperta. Il login resta salvato sul tuo computer (lo stesso di `claude mcp login`), non online e non nel repo.
+- **Gmail e Google Calendar** passano dal login di claude.ai: con una chiave API risultano «non disponibile».
 
-In basso a sinistra c'è l'elenco di cosa l'app ha trovato.
+In basso a sinistra c'è l'elenco di cosa l'app ha trovato. I connettori con login compaiono quando una chat è aperta.
 
 ## DaVinci
 Usa l'estensione «DaVinci Resolve Studio» già installata in Claude Desktop. In DaVinci imposta Preferenze › Sistema › Generale › External scripting = Local.
