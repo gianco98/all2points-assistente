@@ -67,6 +67,10 @@
     <h2>Nuovo progetto</h2>
     <p>Un progetto per cliente o lavoro (es. «Cliente Rossi», «Sito Bianchi»). Tiene insieme chat, allegati e riassunti.</p>
     <input id="nome-progetto" required placeholder="Nome del progetto" autocomplete="off">
+    <label>Cartella esistente sul computer (facoltativa)
+      <input id="cartella-progetto" placeholder="es. C:\Users\…\Desktop\claude code oppure /Users/…/Progetti/Gioco" autocomplete="off">
+    </label>
+    <p class="nota">Se la scrivi, Claude lavora lì dentro come in Claude Code, con il CLAUDE.md, la memoria e le regole di quella cartella. Vale per un sito, un gioco Roblox o la cartella dei clienti.</p>
     <div class="azioni">
       <button type="button" class="secondario" commandfor="dlg-progetto" command="close">Annulla</button>
       <button class="primario" value="ok">Crea</button>

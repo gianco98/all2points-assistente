@@ -72,6 +72,7 @@ def versione_locale() -> str | None:
 def aggiorna(sha: str) -> bool:
     """Scarica la versione nuova in una cartella temporanea e la mette al posto di quella vecchia.
     Tocca solo la cartella `app`: chat, progetti, regole e impostazioni restano dove sono."""
+    tmp = None
     try:
         with urllib.request.urlopen(urllib.request.Request(URL_ZIP, headers={"User-Agent": "a2p"}), timeout=60) as r:
             dati = r.read()
@@ -106,6 +107,8 @@ def aggiorna(sha: str) -> bool:
         log(f"Aggiornamento non riuscito ({errore}): uso la versione che c'è")
         if not APP.exists() and (BASE / "app-vecchia").exists():
             (BASE / "app-vecchia").rename(APP)
+        if tmp:  # senza questo ogni tentativo fallito lasciava una cartella a2p-…
+            shutil.rmtree(tmp, ignore_errors=True)
         return False
 
 

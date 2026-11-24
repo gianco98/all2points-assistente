@@ -33,6 +33,8 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
   - Se Claude sta lavorando, l'aggiornamento aspetta il prossimo avvio.
 - **Chiudi la finestra** quando hai finito. Il motore si spegne da solo dopo 20 minuti senza finestre aperte.
 - **Progetti:** uno per cliente o lavoro, ognuno con le sue chat e il suo `riassunto.md`.
+  - **Progetto da una cartella esistente:** in «Nuovo progetto» scrivi anche il percorso di una cartella (un sito, un gioco Roblox, la cartella dei clienti). Claude lavora lì dentro come in Claude Code, con il `CLAUDE.md`, la memoria e le regole di quella cartella. Nell'elenco ha l'icona 📁. Si vedono solo le chat nate nell'app, non quelle di Claude Code nella stessa cartella.
+  - Se in quella cartella gli hook di avvio di Claude Code sono lenti (es. graphify su una cartella grande), la prima risposta può tardare qualche minuto.
 - **Chat:** restano salvate con tutto il contesto. Si riprendono anche dopo aver spento il computer.
 - **Modelli:** Opus per montaggio e lavori difficili, Sonnet per il lavoro normale, Haiku per le cose semplici.
 - **Permessi** (in alto, accanto al modello):
@@ -48,8 +50,33 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
   - Claude lavora solo nelle schede del gruppo che l'estensione gli assegna.
   - In Chrome disattiva «Chiedi dove salvare ciascun file», altrimenti i download si bloccano.
 
+## Skill e connettori: quelli di chi usa l'app
+L'app li cerca a ogni avvio **sul computer di chi la usa**: ognuno ha i suoi, nessun percorso è scritto nel codice.
+- **Skill:** quelle in `~/.claude/skills`, i plugin di Claude Code e i plugin del tuo Claude Desktop (es. montaggio-davinci, meta-ads, pdf, docx). Restano fuori le poche skill che funzionano solo dentro Desktop.
+- **Connettori di Claude Code:** i server MCP registrati per l'utente in Claude Code, es. **Roblox Studio** (Studio aperto) e agent-desktop.
+- **Estensioni di Claude Desktop:** quelle attive, es. **DaVinci** e **Blender** (con Blender aperto e l'addon collegato). Valgono le versioni di Desktop per Mac, per Windows e del Microsoft Store.
+- **Non ci sono** i connettori dell'account claude.ai (Gmail, Drive, Calendar, Canva…): passano dal login di claude.ai e non funzionano con una chiave API.
+
+In basso a sinistra c'è l'elenco di cosa l'app ha trovato.
+
 ## DaVinci
 Usa l'estensione «DaVinci Resolve Studio» già installata in Claude Desktop. In DaVinci imposta Preferenze › Sistema › Generale › External scripting = Local.
+
+## L'app che si migliora da sola
+- Il progetto **«Assistente - sviluppo»** compare da solo se sul computer c'è **git**. È una copia di questo repo in `All2Points Assistente/sviluppo`.
+- Lì chiedi a Claude cosa migliorare. Claude:
+  1. modifica la copia, mai l'app in uso;
+  2. prova la versione nuova su un'altra porta;
+  3. ti mostra cosa cambia;
+  4. pubblica (push) **solo dopo il tuo ok**.
+- Al riavvio successivo l'app si aggiorna da sola, **anche sui computer degli altri**: per questo il push chiede sempre l'ok.
+- Se una versione si rompe, scrivi «torna alla versione prima»: Claude annulla l'ultima modifica con `git revert` e la ripubblica dopo il tuo ok.
+- Per pubblicare serve l'accesso in scrittura al repo su GitHub.
+
+## Chiave API nuova
+- Su platform.claude.com › API Keys › Create Key crea la chiave.
+- Nell'app apri Impostazioni › Chiave API della Console, incollala e premi Salva. L'app la prova e sostituisce la vecchia nel portachiavi del sistema.
+- Nelle Impostazioni vedi le ultime 4 cifre della chiave in uso. Se la chiave non vale più, l'app lo dice e apre le Impostazioni.
 
 ## Sicurezza
 - Proteggi l'account GitHub di Gianco con la **verifica in due passaggi**: gli aggiornamenti arrivano da lì.

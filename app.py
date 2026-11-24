@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -32,7 +33,7 @@ from pathlib import Path
 import keyring
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from claude_agent_sdk import (
@@ -53,7 +54,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
-PORTA = 8765
+PORTA = int(os.environ.get("A2P_PORTA", "8765"))  # un'altra porta serve per provare una versione nuova
 ORIGINI = {f"http://127.0.0.1:{PORTA}", f"http://localhost:{PORTA}"}
 HOST_OK = {f"127.0.0.1:{PORTA}", f"localhost:{PORTA}"}
 WINDOWS = sys.platform == "win32"
@@ -62,11 +63,13 @@ BASE = Path.home() / "All2Points Assistente"
 PROGETTI = BASE / "progetti"
 CONFIG = BASE / "config.json"
 REGOLE = BASE / "Regole di Gianco - correzioni.md"
-CLAUDE_APP = (
-    Path(os.environ.get("APPDATA", "")) / "Claude"
-    if WINDOWS
-    else Path.home() / "Library" / "Application Support" / "Claude"
-)
+PLUGIN_DESKTOP = BASE / "plugin-desktop"
+REPO = "gianco98/all2points-assistente"
+SVILUPPO = BASE / "sviluppo"  # copia del repo in cui l'assistente migliora sé stesso
+PROGETTO_SVILUPPO = "Assistente - sviluppo"
+# Skill di Claude Desktop legate a strumenti che esistono solo lì (documenti, browser e computer di Desktop).
+SKILL_SOLO_DESKTOP = {"docs", "google-workspace", "computer-use", "chrome-browser", "built-in-browser",
+                      "setup-cowork", "morning", "schedule"}
 MODELLI = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}
 # Permessi: "auto" valuta il rischio di ogni azione, fa da solo quelle sicure e blocca quelle pericolose;
 # "chiedi" chiede conferma per comandi e modifiche ai file.
@@ -125,6 +128,27 @@ def prepara_cartelle() -> None:
         modello_regole = CODICE / "Regole di Gianco - correzioni.md"
         if modello_regole.exists():
             shutil.copy(modello_regole, REGOLE)
+
+
+def prepara_sviluppo() -> None:
+    """Il progetto «Assistente - sviluppo»: una copia del repo dell'app dove Claude la migliora.
+    Serve git; senza, il progetto non compare e l'app funziona come prima."""
+    git = shutil.which("git")
+    if not git:
+        return
+    if not (SVILUPPO / ".git").is_dir():
+        if SVILUPPO.exists():
+            return  # c'è già qualcosa con quel nome: non lo tocchiamo
+        try:
+            subprocess.run([git, "clone", "-q", f"https://github.com/{REPO}.git", str(SVILUPPO)],
+                           timeout=180, check=True, capture_output=True)
+        except (OSError, subprocess.SubprocessError):
+            return
+    progetto = PROGETTI / PROGETTO_SVILUPPO
+    (progetto / "allegati").mkdir(parents=True, exist_ok=True)
+    collegamento = progetto / "cartella.txt"
+    if not collegamento.exists():
+        collegamento.write_text(str(SVILUPPO), encoding="utf-8")
 
 
 def chiave_valida(chiave: str) -> bool:
@@ -191,6 +215,18 @@ def cartella_progetto(nome: str) -> Path:
     return cartella
 
 
+def cartella_lavoro(nome: str) -> Path:
+    """Dove Claude lavora: la cartella vera collegata al progetto (es. Desktop\\claude code, con il suo
+    CLAUDE.md e la sua memoria) oppure, se non ce n'è una, la cartella del progetto nell'app.
+    Il collegamento sta in «cartella.txt» dentro il progetto: ognuno ha i suoi percorsi sul suo computer."""
+    dati = cartella_progetto(nome)
+    try:
+        collegata = Path((dati / "cartella.txt").read_text(encoding="utf-8").strip())
+    except OSError:
+        return dati
+    return collegata if collegata.is_dir() else dati
+
+
 def registra_spesa(dollari: float) -> None:
     if dollari <= 0:
         return
@@ -219,56 +255,172 @@ def avvisa_telefono(testo: str, titolo: str = "Assistente All2Points") -> bool:
 
 # ---------- server MCP ----------
 
-def trova_estensione_davinci() -> dict | None:
-    """Comando dell'estensione "DaVinci Resolve Studio" installata in Claude Desktop."""
-    for manifest_path in sorted((CLAUDE_APP / "Claude Extensions").glob("*/manifest.json")):
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        nomi = f"{manifest.get('name', '')} {manifest.get('display_name', '')}".lower()
-        if "davinci" not in nomi and "resolve" not in nomi:
-            continue
+def cartelle_claude_desktop() -> list[Path]:
+    """Dove il Claude Desktop di chi usa l'app tiene estensioni e plugin. Cambia da computer a computer:
+    Mac, Windows con l'installatore (APPDATA) e Windows del Microsoft Store (LOCALAPPDATA/Claude-Data)."""
+    if not WINDOWS:
+        candidati = [Path.home() / "Library" / "Application Support" / "Claude"]
+    else:
+        locale = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        candidati = [Path(os.environ.get("APPDATA", "")) / "Claude",
+                     *sorted(locale.glob("Claude-Data/*")),
+                     *sorted(locale.glob("Packages/Claude_*/LocalCache/Roaming/Claude"))]
+    return [c for c in candidati if (c / "Claude Extensions").is_dir() or (c / "rpm").is_dir()]
 
-        cartella_ext = manifest_path.parent
-        cfg = dict(manifest["server"]["mcp_config"])
-        cfg.update(cfg.pop("platform_overrides", {}).get(sys.platform, {}))
 
-        valori = {k: v.get("default") for k, v in manifest.get("user_config", {}).items()}
-        for impostazioni in (CLAUDE_APP / "Claude Extensions Settings").glob("*.json"):
-            if cartella_ext.name in impostazioni.stem or impostazioni.stem in cartella_ext.name:
-                dati = json.loads(impostazioni.read_text(encoding="utf-8"))
-                valori.update(dati.get("userConfig") or dati.get("user_config") or {})
-
-        variabili = {
-            "__dirname": str(cartella_ext),
-            "HOME": str(Path.home()),
-            "DESKTOP": str(Path.home() / "Desktop"),
-            "DOCUMENTS": str(Path.home() / "Documents"),
-            "DOWNLOADS": str(Path.home() / "Downloads"),
-            "pathSeparator": os.sep,
-            "/": os.sep,
-        }
-
-        def sostituisci(testo: str) -> str:
-            def valore(m: re.Match) -> str:
-                k = m.group(1)
-                if k.startswith("user_config."):
-                    v = valori.get(k.split(".", 1)[1])
-                    return "" if v is None else (" ".join(map(str, v)) if isinstance(v, list) else str(v))
-                return variabili.get(k, m.group(0))
-            return re.sub(r"\$\{([^}]+)\}", valore, testo)
-
-        comando = sostituisci(cfg["command"])
-        if not shutil.which(comando) and not Path(comando).exists():
-            return None
-        return {
-            "type": "stdio",
-            "command": comando,
-            "args": [sostituisci(a) for a in cfg.get("args", [])],
-            "env": {k: sostituisci(str(v)) for k, v in cfg.get("env", {}).items()},
-        }
+def trova_comando(nome: str) -> str | None:
+    """Un programma nel PATH, in ~/.local/bin o, per uv, quello che Claude Desktop si porta dietro."""
+    trovato = shutil.which(nome) or shutil.which(nome, path=str(Path.home() / ".local" / "bin"))
+    if trovato or nome != "uv":
+        return trovato
+    for base in cartelle_claude_desktop():
+        for uv in base.glob("uv-runtime/**/uv.exe" if WINDOWS else "uv-runtime/**/uv"):
+            return str(uv)
     return None
+
+
+def _nome_estensione(manifest: dict, cartella: Path) -> str:
+    nomi = f"{manifest.get('name', '')} {manifest.get('display_name', '')}".lower()
+    if "davinci" in nomi or "resolve" in nomi:
+        return "davinci"
+    if "blender" in nomi:
+        return "blender"
+    return re.sub(r"[^a-z0-9]+", "-", (manifest.get("name") or cartella.name).lower()).strip("-")[:30]
+
+
+def trova_estensioni() -> dict[str, dict]:
+    """Le estensioni attive nel Claude Desktop di chi usa l'app (DaVinci, Blender…), come server MCP."""
+    server = {}
+    for base in cartelle_claude_desktop():
+        for manifest_path in sorted((base / "Claude Extensions").glob("*/manifest.json")):
+            trovata = _estensione(base, manifest_path)
+            if trovata:
+                server.setdefault(*trovata)
+    return server
+
+
+def _estensione(base: Path, manifest_path: Path) -> tuple[str, dict] | None:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        cfg = dict(manifest["server"]["mcp_config"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    cartella_ext = manifest_path.parent
+    cfg.update(cfg.pop("platform_overrides", {}).get(sys.platform, {}))
+
+    valori = {k: v.get("default") for k, v in manifest.get("user_config", {}).items()}
+    for impostazioni in (base / "Claude Extensions Settings").glob("*.json"):
+        if cartella_ext.name in impostazioni.stem or impostazioni.stem in cartella_ext.name:
+            try:
+                dati = json.loads(impostazioni.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if dati.get("isEnabled") is False:  # spenta in Claude Desktop: spenta anche qui
+                return None
+            valori.update(dati.get("userConfig") or dati.get("user_config") or {})
+
+    variabili = {
+        "__dirname": str(cartella_ext),
+        "HOME": str(Path.home()),
+        "DESKTOP": str(Path.home() / "Desktop"),
+        "DOCUMENTS": str(Path.home() / "Documents"),
+        "DOWNLOADS": str(Path.home() / "Downloads"),
+        "pathSeparator": os.sep,
+        "/": os.sep,
+    }
+
+    def sostituisci(testo: str) -> str:
+        def valore(m: re.Match) -> str:
+            k = m.group(1)
+            if k.startswith("user_config."):
+                v = valori.get(k.split(".", 1)[1])
+                return "" if v is None else (" ".join(map(str, v)) if isinstance(v, list) else str(v))
+            return variabili.get(k, m.group(0))
+        return re.sub(r"\$\{([^}]+)\}", valore, testo)
+
+    comando = sostituisci(cfg["command"])
+    argomenti = [sostituisci(a) for a in cfg.get("args", [])]
+    if manifest["server"].get("type") == "uv" and comando == "uv" and argomenti[:1] == ["run"]:
+        # Le estensioni «uv» (es. Blender) Desktop le avvia dentro la loro cartella.
+        argomenti = ["run", "--directory", str(cartella_ext), *argomenti[1:]]
+    trovato = trova_comando(comando) or (comando if Path(comando).exists() else None)
+    if not trovato:
+        return None
+    return _nome_estensione(manifest, cartella_ext), {
+        "type": "stdio",
+        "command": trovato,
+        "args": argomenti,
+        "env": {k: sostituisci(str(v)) for k, v in cfg.get("env", {}).items()},
+    }
+
+
+def _piu_recente(file: list[Path]) -> Path | None:
+    return max(file, key=lambda f: f.stat().st_mtime, default=None)
+
+
+def plugin_desktop() -> list[dict]:
+    """I plugin e le skill che il Claude Desktop di chi usa l'app scarica dal suo account
+    (es. montaggio-davinci, meta-ads, pdf, docx): ognuno ha i suoi, sul suo computer."""
+    plugin = []
+    for base in cartelle_claude_desktop():
+        elenco = _piu_recente(list(base.glob("rpm/*/*/manifest.json")))
+        if elenco:
+            try:
+                voci = json.loads(elenco.read_text(encoding="utf-8")).get("plugins", [])
+            except (OSError, ValueError):
+                voci = []
+            for voce in voci:
+                cartella = elenco.parent / str(voce.get("id", ""))
+                if voce.get("id") and (cartella / ".claude-plugin" / "plugin.json").exists():
+                    plugin.append({"type": "local", "path": str(cartella)})
+        skill = _piu_recente(list(base.glob("local-agent-mode-sessions/skills-plugin/*/*/manifest.json")))
+        copia = _copia_skill_anthropic(skill.parent) if skill else None
+        if copia:
+            plugin.append({"type": "local", "path": str(copia)})
+        if plugin:
+            break  # un solo Claude Desktop per computer
+    return plugin
+
+
+def _copia_skill_anthropic(origine: Path) -> Path | None:
+    """Le skill «anthropic-skills» (pdf, docx, xlsx…) senza quelle che usano strumenti solo di Desktop.
+    Si copiano in una cartella dell'app perché un plugin si carica intero."""
+    def lungo(p: Path) -> str:
+        # Su Windows docx, pptx e xlsx superano i 260 caratteri di percorso: serve il prefisso \\?\
+        return "\\\\?\\" + str(p.resolve()) if WINDOWS else str(p)
+
+    destinazione = PLUGIN_DESKTOP / "anthropic-skills"
+    firma = destinazione / "origine.txt"  # da dove e di quando è la copia: si rifà solo se Desktop le aggiorna
+    try:
+        attuale = f"{origine}\n{(origine / 'manifest.json').stat().st_mtime}"
+        if firma.exists() and firma.read_text(encoding="utf-8") == attuale:
+            return destinazione
+        attive = {s["name"] for s in json.loads((origine / "manifest.json").read_text(encoding="utf-8"))["skills"]
+                  if s.get("enabled", True)}
+        shutil.rmtree(lungo(destinazione), ignore_errors=True)
+        shutil.copytree(origine / ".claude-plugin", destinazione / ".claude-plugin")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    for cartella in (origine / "skills").iterdir():
+        if cartella.is_dir() and cartella.name in attive - SKILL_SOLO_DESKTOP:
+            try:
+                shutil.copytree(lungo(cartella), lungo(destinazione / "skills" / cartella.name))
+            except OSError:
+                continue  # una skill che non si copia non deve togliere le altre
+    try:
+        firma.write_text(attuale, encoding="utf-8")
+    except OSError:
+        pass
+    return destinazione
+
+
+def connettori_claude_code() -> list[str]:
+    """I server MCP che il Claude Code di chi usa l'app ha registrato per l'utente (es. Roblox Studio):
+    il motore li carica da solo, qui servono solo per mostrarli."""
+    try:
+        return sorted(json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8")).get("mcpServers", {}))
+    except (OSError, ValueError, AttributeError):
+        return []
 
 
 def server_browser() -> dict | None:
@@ -302,16 +454,28 @@ async def strumento_avviso(args):
     return {"content": [{"type": "text", "text": "Avviso inviato." if ok else "Avviso non inviato (rete o avvisi non configurati)."}]}
 
 
-def stato_strumenti() -> dict:
-    return {
-        "davinci": trova_estensione_davinci() is not None,
-        "browser": shutil.which("npx") is not None,
-        "skill": (Path.home() / ".claude" / "skills").is_dir(),
-    }
+NOMI_CONNETTORI = {"davinci": "DaVinci", "blender": "Blender", "browser": "Browser", "avvisi": "Avviso",
+                   "Roblox_Studio": "Roblox Studio", "agent-desktop": "Desktop"}
 
 
-def istruzioni(progetto: Path) -> str:
+def stato_strumenti() -> list[dict]:
+    """Cosa trova l'app su questo computer: lo mostra in alto, uguale per chi la usa ma con i suoi strumenti."""
+    estensioni = trova_estensioni()
+    voci = [{"nome": "DaVinci", "ok": "davinci" in estensioni},
+            {"nome": "Browser", "ok": shutil.which("npx") is not None},
+            {"nome": "Skill", "ok": (Path.home() / ".claude" / "skills").is_dir()}]
+    voci += [{"nome": NOMI_CONNETTORI.get(n, n), "ok": True} for n in estensioni if n != "davinci"]
+    voci += [{"nome": NOMI_CONNETTORI.get(n, n), "ok": True} for n in connettori_claude_code()]
+    return voci
+
+
+def istruzioni(progetto: Path, lavoro: Path) -> str:
     cfg = leggi_config()
+    collegata = (
+        f"\n- Lavori nella cartella collegata {lavoro}: valgono il suo CLAUDE.md, la sua memoria e le sue regole, "
+        "come in Claude Code. Riassunti e allegati restano nella cartella del progetto qui sopra."
+        if lavoro != progetto else ""
+    )
     if cfg.get("browser_modo") == "mio":
         descrizione_browser = (
             "È il Chrome di tutti i giorni dell'utente, con i suoi login: lavori solo nelle schede del gruppo "
@@ -328,7 +492,7 @@ def istruzioni(progetto: Path) -> str:
 Sei l'Assistente All2Points, basato su Claude, per lo studio All2Points (video, social, siti web).
 Rispondi sempre in italiano, in modo chiaro e pratico. Chi ti scrive: {cfg.get('nome') or 'un membro del team'}.
 
-Cartella del progetto «{progetto.name}»: {progetto}
+Cartella del progetto «{progetto.name}»: {progetto}{collegata}
 - Prima di lavorare leggi i file .md della cartella del progetto (riassunti, note) e, per i video, il file regole: {REGOLE}. Le correzioni di Gianco valgono più delle skill.
 - Gli allegati dell'utente sono in {progetto / 'allegati'}: leggili con Read quando te li indico.
 - A fine lavoro, o quando te lo chiedo, aggiorna «riassunto.md» nella cartella del progetto: cosa è fatto, cosa manca, dove siamo rimasti, percorsi utili.
@@ -336,9 +500,28 @@ Cartella del progetto «{progetto.name}»: {progetto}
 
 Strumenti:
 - DaVinci Resolve: server MCP «davinci» (se collegato).
+- Altri connettori: quelli che chi ti usa ha messo in Claude Code e in Claude Desktop sul suo computer (es. Roblox Studio, Blender). Usali come in Claude Code. Per Roblox, prima di ogni lavoro chiama list_roblox_studios e list_roblox_skills e apri la skill Roblox che serve.
+- Skill: hai le skill di chi ti usa (~/.claude/skills e i plugin del suo Claude Desktop). Apri quella giusta prima di lavorare, come in Claude Code.
 - Browser: server MCP «browser». {descrizione_browser}
   Le password non le inserisci mai: se serve un login, chiedi all'utente di farlo nella finestra del browser.
 - Avvisi: lo strumento avvisa_telefono manda una notifica sul telefono. Usalo quando finisci un lavoro lungo o ti serve una decisione mentre l'utente non è al computer.
+{istruzioni_sviluppo() if lavoro == SVILUPPO else ""}
+""".strip()
+
+
+def istruzioni_sviluppo() -> str:
+    """Come l'assistente migliora sé stesso: nella copia del repo, mai nell'app in uso."""
+    return f"""
+Questo è il progetto per migliorare l'app stessa. Stai lavorando in {SVILUPPO}, una copia del repo GitHub {REPO}.
+L'app in uso sta in {CODICE}: non toccarla mai, la sostituisce l'aggiornamento automatico.
+Regole, in quest'ordine:
+1. Prima `git pull`, poi ripeti con parole tue cosa cambi e aspetta l'ok dell'utente.
+2. Una modifica alla volta. L'app la usano più persone del team, ognuna sul suo computer (Windows o Mac): niente percorsi, nomi o chiavi di una persona nel codice. Tutto si cerca sul computer di chi la usa. Il repo è pubblico: mai segreti nei file.
+3. Prova la versione nuova prima di proporla: avviala in background da {SVILUPPO} con le variabili A2P_PORTA=8790 e A2P_NO_BROWSER=1 (`uv run --script app.py`), controlla http://127.0.0.1:8790/api/stato e la funzione cambiata, poi spegnila con una POST a /api/spegni (header Origin: http://127.0.0.1:8790).
+4. Mostra all'utente cosa cambia (`git diff --stat` e due righe per modifica) e chiedi l'ok per pubblicare.
+5. Solo dopo l'ok: `git commit` con un messaggio in italiano che dice cosa cambia per chi usa l'app, poi `git push`. Di' all'utente di chiudere e riaprire l'app: si aggiorna da sola, anche sui computer degli altri.
+6. Se una versione pubblicata si rompe: «torna alla versione prima» = `git revert` dell'ultimo commit, prova come al punto 3, push dopo l'ok.
+7. Se il push fallisce per i permessi, chi usa l'app non ha accesso in scrittura al repo: dillo e lascia il commit in locale.
 """.strip()
 
 
@@ -361,7 +544,11 @@ async def solo_locale(request: Request, call_next):
 
 @app.get("/")
 async def pagina():
-    return FileResponse(CODICE / "static" / "index.html")
+    # La versione negli indirizzi: dopo un aggiornamento il browser non usa il vecchio app.js dalla cache.
+    v = versione()
+    html = (CODICE / "static" / "index.html").read_text(encoding="utf-8")
+    html = html.replace("/static/app.js", f"/static/app.js?v={v}").replace("/static/style.css", f"/static/style.css?v={v}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/stato")
@@ -369,6 +556,7 @@ async def stato():
     cfg = leggi_config()
     return {
         "chiave": bool(chiave()),
+        "chiave_fine": (chiave() or "")[-4:],  # solo le ultime 4 cifre, per capire quale chiave è collegata
         "nome": cfg.get("nome", ""),
         "modello": cfg.get("modello", "opus"),
         "permessi": cfg.get("permessi", "auto"),
@@ -425,38 +613,79 @@ async def avviso_prova():
 async def progetti():
     elenco = []
     for cartella in PROGETTI.iterdir():
-        if cartella.is_dir():
-            elenco.append({"nome": cartella.name, "modificato": cartella.stat().st_mtime})
+        # Le cartelle nascoste (es. .claude, creata dagli hook di Claude Code) non sono progetti.
+        if cartella.is_dir() and nome_sicuro(cartella.name) == cartella.name:
+            lavoro = cartella_lavoro(cartella.name)
+            elenco.append({"nome": cartella.name, "modificato": cartella.stat().st_mtime,
+                           "cartella": str(lavoro) if lavoro != cartella else None})
     elenco.sort(key=lambda p: -p["modificato"])
     return elenco
 
 
 @app.post("/api/progetti")
 async def nuovo_progetto(request: Request):
-    nome = nome_sicuro((await request.json()).get("nome", ""))
+    dati = await request.json()
+    nome = nome_sicuro(dati.get("nome", ""))
     if not nome:
         raise HTTPException(400, "Scrivi un nome per il progetto")
+    collegata = str(dati.get("cartella") or "").strip().strip("\"'")
+    if collegata and not Path(collegata).is_dir():
+        raise HTTPException(400, "Questa cartella non esiste su questo computer")
     (PROGETTI / nome / "allegati").mkdir(parents=True, exist_ok=True)
+    if collegata:
+        (PROGETTI / nome / "cartella.txt").write_text(str(Path(collegata).resolve()), encoding="utf-8")
     return {"nome": nome}
+
+
+def chat_dell_app(progetto: str) -> set[str] | None:
+    """Per un progetto collegato a una cartella vera, le chat nate nell'app: le altre chat di Claude Code
+    in quella cartella non si mostrano e non si possono eliminare da qui. None = progetto normale."""
+    dati = cartella_progetto(progetto)
+    if cartella_lavoro(progetto) == dati:
+        return None
+    try:
+        return set((dati / "chat-app.txt").read_text(encoding="utf-8").split())
+    except OSError:
+        return set()
+
+
+def ricorda_chat(progetto: Path, sid: str) -> None:
+    file = progetto / "chat-app.txt"
+    try:
+        gia = set(file.read_text(encoding="utf-8").split())
+    except OSError:
+        gia = set()
+    if sid and sid not in gia:
+        with file.open("a", encoding="utf-8") as f:
+            f.write(sid + "\n")
+
+
+def chat_permessa(sid: str, progetto: str) -> None:
+    ammesse = chat_dell_app(progetto)
+    if ammesse is not None and sid not in ammesse:
+        raise HTTPException(404, "Chat non trovata in questo progetto")
 
 
 @app.get("/api/chat")
 async def chat(progetto: str):
-    cartella = cartella_progetto(progetto)
-    sessioni = await asyncio.to_thread(list_sessions, str(cartella), 100)
+    ammesse = chat_dell_app(progetto)
+    sessioni = await asyncio.to_thread(list_sessions, str(cartella_lavoro(progetto)), 100 if ammesse is None else 2000)
+    if ammesse is not None:
+        sessioni = [s for s in sessioni if s.session_id in ammesse]
     return [
         {
             "id": s.session_id,
             "titolo": (s.custom_title or s.first_prompt or s.summary or "Chat")[:70],
             "modificata": s.last_modified,
         }
-        for s in sessioni
+        for s in sessioni[:100]
     ]
 
 
 @app.get("/api/chat/{sid}")
 async def messaggi(sid: str, progetto: str):
-    cartella = cartella_progetto(progetto)
+    chat_permessa(sid, progetto)
+    cartella = cartella_lavoro(progetto)
     righe = []
     for m in await asyncio.to_thread(get_session_messages, sid, str(cartella)):
         if m.parent_tool_use_id:
@@ -476,13 +705,15 @@ async def messaggi(sid: str, progetto: str):
 @app.post("/api/chat/{sid}/rinomina")
 async def rinomina(sid: str, progetto: str, request: Request):
     titolo = (await request.json()).get("titolo", "").strip()[:100]
-    await asyncio.to_thread(rename_session, sid, titolo, str(cartella_progetto(progetto)))
+    chat_permessa(sid, progetto)
+    await asyncio.to_thread(rename_session, sid, titolo, str(cartella_lavoro(progetto)))
     return {"ok": True}
 
 
 @app.delete("/api/chat/{sid}")
 async def elimina(sid: str, progetto: str):
-    await asyncio.to_thread(delete_session, sid, str(cartella_progetto(progetto)))
+    chat_permessa(sid, progetto)
+    await asyncio.to_thread(delete_session, sid, str(cartella_lavoro(progetto)))
     return {"ok": True}
 
 
@@ -497,6 +728,19 @@ async def allegati(progetto: str, file: UploadFile = File(...)):
     return {"percorso": str(destinazione), "nome": nome}
 
 
+CHIAVE_NON_VALIDA = ("La chiave API non è valida o è stata revocata. Creane una nuova su platform.claude.com › "
+                     "API Keys › Create Key e incollala in Impostazioni › Chiave API della Console.")
+
+
+def spiega_errore(testo: str) -> str:
+    basso = str(testo).lower()
+    if "invalid api key" in basso or "authentication_error" in basso or "invalid x-api-key" in basso:
+        return CHIAVE_NON_VALIDA
+    if "credit balance" in basso:
+        return "Crediti API finiti: ricaricali su platform.claude.com › Billing."
+    return str(testo)
+
+
 def riassumi_strumento(nome: str, dati: dict) -> str:
     etichette = {
         "Read": "Legge", "Write": "Scrive", "Edit": "Modifica", "Bash": "Comando",
@@ -506,7 +750,7 @@ def riassumi_strumento(nome: str, dati: dict) -> str:
     }
     if nome.startswith("mcp__"):
         _, server, azione = (nome.split("__", 2) + ["", ""])[:3]
-        etichetta = {"davinci": "DaVinci", "browser": "Browser", "avvisi": "Avviso"}.get(server, server)
+        etichetta = NOMI_CONNETTORI.get(server, server)
         dettaglio = dati.get("url") or dati.get("element") or ""
         return f"{etichetta}: {azione.replace('_', ' ')} {dettaglio}".strip()
     dettaglio = (dati.get("command") or dati.get("file_path") or dati.get("pattern")
@@ -563,6 +807,9 @@ async def sessione(ws: WebSocket):
     async def apri(progetto: str, sid: str | None, modello: str, permessi: str):
         await chiudi()
         cartella = cartella_progetto(progetto)
+        lavoro = cartella_lavoro(progetto)
+        if sid and lavoro != cartella:
+            chat_permessa(sid, progetto)
         (cartella / "allegati").mkdir(exist_ok=True)
         k = chiave()
         if not k:
@@ -570,25 +817,27 @@ async def sessione(ws: WebSocket):
             return
         cfg = leggi_config()
         server = {"avvisi": create_sdk_mcp_server("avvisi", tools=[strumento_avviso])}
-        davinci = await asyncio.to_thread(trova_estensione_davinci)
-        if davinci:
-            server["davinci"] = davinci
+        estensioni = await asyncio.to_thread(trova_estensioni)
+        server.update(estensioni)
+        plugin = await asyncio.to_thread(plugin_desktop)
+        davinci = estensioni.get("davinci")
         browser = server_browser()
         if browser:
             server["browser"] = browser
         extra = [c for c in cfg.get("cartelle_extra", []) if Path(c).exists()]
         opzioni = ClaudeAgentOptions(
             model=MODELLI.get(modello, MODELLI["opus"]),
-            cwd=str(cartella),
-            system_prompt={"type": "preset", "preset": "claude_code", "append": istruzioni(cartella)},
+            cwd=str(lavoro),
+            system_prompt={"type": "preset", "preset": "claude_code", "append": istruzioni(cartella, lavoro)},
             setting_sources=["user", "project"],
             skills="all",
             mcp_servers=server,
+            plugins=plugin,
             can_use_tool=chiedi_permesso,
             permission_mode=PERMESSI.get(permessi, "auto"),
             include_partial_messages=True,
             resume=sid,
-            add_dirs=[str(BASE), *extra],
+            add_dirs=[str(BASE), *([str(cartella)] if lavoro != cartella else []), *extra],
             env={"ANTHROPIC_API_KEY": k},
         )
         client = ClaudeSDKClient(options=opzioni)
@@ -622,13 +871,15 @@ async def sessione(ws: WebSocket):
                         if isinstance(b, ToolUseBlock):
                             await invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(m.parent_tool_use_id))
                 elif isinstance(m, SystemMessage) and m.subtype == "init":
+                    ricorda_chat(stato["progetto"], m.data.get("session_id"))
                     await invia(tipo="sessione", id=m.data.get("session_id"))
                 elif isinstance(m, ResultMessage):
                     if m.total_cost_usd is not None:
                         stato["costo"] = m.total_cost_usd
                     registra_spesa(stato["costo"] - costo_prima)
+                    ricorda_chat(stato["progetto"], m.session_id)
                     await invia(tipo="fine", costo=stato["costo"], sessione=m.session_id,
-                                errore=(m.result or m.subtype) if m.is_error else None,
+                                errore=spiega_errore(m.result or m.subtype) if m.is_error else None,
                                 spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
             if time.monotonic() - inizio > 120:
                 await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{stato['progetto'].name}».")
@@ -697,7 +948,10 @@ def avvia(apri_finestra=None) -> None:
     # Se l'app viene avviata da dentro Claude Code, non deve ereditarne sessione e impostazioni.
     for variabile in [v for v in os.environ if v.startswith(("CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_SESSION"))]:
         del os.environ[variabile]
+    # Gli hook di avvio di Claude Code (es. graphify su una cartella grande) possono metterci minuti.
+    os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "600000")
     prepara_cartelle()
+    threading.Thread(target=prepara_sviluppo, daemon=True).start()
     print(f"Assistente All2Points {versione()}: http://127.0.0.1:{PORTA}")
     if not os.environ.get("A2P_NO_BROWSER"):
         threading.Timer(1.5, apri_finestra or (lambda: webbrowser.open(f"http://127.0.0.1:{PORTA}"))).start()

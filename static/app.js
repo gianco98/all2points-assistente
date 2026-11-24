@@ -140,6 +140,7 @@ function ricevi(m) {
       stato.bolla = null;
       inLavoro(false);
       if (m.errore) aggiungi('msg claude errore', m.errore);
+      if (m.errore?.startsWith('La chiave API')) $('#dlg-impostazioni').showModal();
       el.costo.textContent = `Questa chat: ${dollari(m.costo)}`;
       el.spesaMese.textContent = `Speso questo mese: ${dollari(m.spesa_mese)}`;
       if (m.sessione) { stato.sessione = m.sessione; ultimaChat.salva(stato.progetto, m.sessione); }
@@ -175,7 +176,11 @@ async function caricaProgetti(scegli) {
     await api('/api/progetti', { method: 'POST', body: JSON.stringify({ nome: 'Generale' }) });
     return caricaProgetti('Generale');
   }
-  for (const p of elenco) el.progetto.append(new Option(p.nome, p.nome));
+  for (const p of elenco) {
+    const voce = new Option(p.cartella ? `📁 ${p.nome}` : p.nome, p.nome);
+    if (p.cartella) voce.title = p.cartella;
+    el.progetto.append(voce);
+  }
   const salvato = scegli || localStorage.getItem('a2p-progetto');
   if (salvato && elenco.some((p) => p.nome === salvato)) el.progetto.value = salvato;
   await cambiaProgetto();
@@ -335,10 +340,12 @@ $('#form-progetto').addEventListener('submit', async (e) => {
   if (e.submitter?.value !== 'ok') return;
   e.preventDefault();
   const nome = $('#nome-progetto').value.trim();
+  const cartella = $('#cartella-progetto').value.trim();
   try {
-    const p = await api('/api/progetti', { method: 'POST', body: JSON.stringify({ nome }) });
+    const p = await api('/api/progetti', { method: 'POST', body: JSON.stringify({ nome, cartella }) });
     $('#dlg-progetto').close();
     $('#nome-progetto').value = '';
+    $('#cartella-progetto').value = '';
     await caricaProgetti(p.nome);
   } catch (err) { alert(err.message); }
 });
@@ -350,7 +357,9 @@ async function caricaStato() {
   $('#imp-modello').value = s.modello;
   $('#imp-cartelle').value = s.cartelle_extra.join('\n');
   $('#imp-topic').textContent = s.avvisi_topic;
-  $('#imp-chiave-stato').textContent = s.chiave ? 'Chiave salvata ✓' : 'Nessuna chiave salvata: incollala qui sopra.';
+  $('#imp-chiave-stato').textContent = s.chiave
+    ? `Chiave salvata ✓ (finisce con …${s.chiave_fine}). Per cambiarla incolla quella nuova qui sopra e premi Salva.`
+    : 'Nessuna chiave salvata: creala su platform.claude.com › API Keys e incollala qui sopra.';
   document.querySelector(`input[name="browser"][value="${s.browser_modo}"]`).checked = true;
   $('#imp-token-stato').textContent = s.estensione_token
     ? 'Codice salvato ✓'
@@ -360,8 +369,14 @@ async function caricaStato() {
   el.spesaMese.textContent = `Speso questo mese: ${dollari(s.spesa_mese)}`;
   $('#versione').textContent = `Versione ${s.versione}`;
   const t = s.strumenti;
-  el.strumenti.innerHTML = [['DaVinci', t.davinci], ['Browser', t.browser], ['Skill', t.skill]]
-    .map(([n, ok]) => `<span class="${ok ? 'ok' : 'no'}" title="${ok ? 'Collegato' : 'Non disponibile su questo computer'}">${n}</span>`).join('');
+  // I nomi vengono dalle configurazioni di chi usa l'app: si mettono come testo, non come HTML.
+  el.strumenti.replaceChildren(...t.map(({ nome, ok }) => {
+    const voce = document.createElement('span');
+    voce.className = ok ? 'ok' : 'no';
+    voce.title = ok ? 'Collegato' : 'Non disponibile su questo computer';
+    voce.textContent = nome;
+    return voce;
+  }));
   return s;
 }
 el.modello.addEventListener('change', () => (el.modello.dataset.toccato = '1'));
