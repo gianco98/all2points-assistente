@@ -7,10 +7,10 @@ const el = {
   spesaMese: $('#spesa-mese'), contesto: $('#contesto'),
   anteprima: $('#anteprima'), anteprimaFile: $('#anteprima-file'), anteprimaFrame: $('#anteprima-frame'),
   anteprimaMessaggio: $('#anteprima-messaggio'), anteprimaUrl: $('#anteprima-url'),
-  coda: $('#coda'), avvisi: $('#avvisi'),
+  coda: $('#coda'), avvisi: $('#avvisi'), schede: $('#schede'),
 };
 
-let stato = { progetto: null, sessione: null, chiave: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null, inCorso: [], apertura: 0 };
+let stato = { progetto: null, sessione: null, chiave: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null, inCorso: [], apertura: 0, vai: 0 };
 const TITOLO = 'Assistente All2Points';
 
 // ---- comandi dichiarativi per i <dialog> (fallback per browser senza Invoker Commands) ----
@@ -118,6 +118,7 @@ function segniInCorso() {
   });
   const progetti = new Set(stato.inCorso.map((x) => x.progetto));
   for (const o of el.progetto.options) o.text = o.dataset.base + (progetti.has(o.value) ? ' ●' : '');
+  schede.disegna();
 }
 // Riquadro «In coda»: i messaggi scritti mentre Claude lavora.
 function disegnaCoda(coda) {
@@ -147,6 +148,172 @@ function disegnaCoda(coda) {
   el.coda.replaceChildren(titolo, ...voci);
 }
 
+// ---- schede: le chat aperte in questa finestra (la chat continua a lavorare anche se chiudi la scheda) ----
+const MAX_SCHEDE = 8;
+const schede = {
+  lista: [],
+  attiva: null,
+  lavora(s) {
+    if (s === this.attiva && stato.lavoro) return true;
+    return !!s.sessione && stato.inCorso.some((x) => x.progetto === s.progetto && x.sessione === s.sessione);
+  },
+  salva() {
+    try {
+      localStorage.setItem('a2p-schede', JSON.stringify(this.lista.filter((s) => s.sessione).map(({ progetto, sessione, titolo }) => ({ progetto, sessione, titolo }))));
+      const a = this.attiva;
+      if (a?.sessione) localStorage.setItem('a2p-scheda-attiva', JSON.stringify({ progetto: a.progetto, sessione: a.sessione }));
+      else localStorage.removeItem('a2p-scheda-attiva');
+    } catch {}
+  },
+  ripristina() {
+    try {
+      const salvate = JSON.parse(localStorage.getItem('a2p-schede') || '[]');
+      this.lista = salvate.filter((s) => typeof s?.progetto === 'string' && typeof s?.sessione === 'string')
+        .slice(-MAX_SCHEDE).map((s) => ({ id: crypto.randomUUID(), progetto: s.progetto, sessione: s.sessione, chiave: null, titolo: String(s.titolo || 'Chat'), vuota: false, finita: false }));
+      const a = JSON.parse(localStorage.getItem('a2p-scheda-attiva') || 'null');
+      const s = a && this.lista.find((x) => x.progetto === a.progetto && x.sessione === a.sessione);
+      if (s) {
+        this.attiva = s;
+        localStorage.setItem('a2p-progetto', s.progetto);
+        ultimaChat.salva(s.progetto, s.sessione);
+      }
+    } catch {}
+    this.disegna();
+  },
+  // La finestra è su questa chat: la scheda c'è già oppure si crea.
+  attivaChat(progetto, sid, titolo, chiave) {
+    let s = this.lista.find((x) => x.progetto === progetto && (sid ? x.sessione === sid : x.chiave === chiave));
+    if (!s) {
+      if (!sid) this.lista = this.lista.filter((x) => x.progetto !== progetto || x.sessione || !x.vuota || this.lavora(x));  // una sola chat nuova e vuota per progetto
+      s = { id: crypto.randomUUID(), progetto, sessione: sid || null, chiave: sid ? null : chiave, titolo: titolo || 'Nuova chat', vuota: !sid, finita: false };
+      this.lista.push(s);
+    } else if (titolo) s.titolo = titolo;
+    this.attiva = s;
+    s.finita = false;
+    while (this.lista.length > MAX_SCHEDE) {
+      const vecchia = this.lista.find((x) => x !== s && !this.lavora(x));
+      if (!vecchia) break;
+      this.lista.splice(this.lista.indexOf(vecchia), 1);
+    }
+    this.salva();
+    this.disegna();
+  },
+  assegna(sid) {
+    const s = this.attiva;
+    if (!s || s.sessione) return;
+    s.sessione = sid;
+    s.chiave = null;
+    this.salva();
+    this.disegna();
+  },
+  scrivi(titolo) {
+    if (!this.attiva) return;
+    this.attiva.vuota = false;
+    this.attiva.titolo = titolo;
+    this.disegna();
+  },
+  // Chat nate in una scheda che non guardavamo: il motore ci dice quale sessione hanno avuto.
+  sincronizza(voci) {
+    let cambiato = false;
+    for (const s of this.lista) {
+      if (s.sessione) continue;
+      const v = voci.find((x) => x.sessione && x.progetto === s.progetto && x.chiavi?.includes(s.chiave));
+      if (v) { s.sessione = v.sessione; s.chiave = null; cambiato = true; }
+    }
+    if (cambiato) this.salva();
+  },
+  finita(m) {
+    const s = this.lista.find((x) => x.progetto === m.progetto && x.sessione === m.sessione);
+    if (s && s !== this.attiva) { s.finita = true; this.disegna(); }
+  },
+  // Titoli aggiornati dall'elenco; una chat sparita dall'elenco (eliminata) perde la scheda.
+  aggiorna(progetto, chat) {
+    const prima = this.lista.length;
+    let cambiato = false;
+    this.lista = this.lista.filter((s) => {
+      if (s.progetto !== progetto || !s.sessione) return true;
+      const c = chat.find((x) => x.id === s.sessione);
+      if (c) { if (c.titolo !== s.titolo) { s.titolo = c.titolo; cambiato = true; } return true; }
+      return s === this.attiva || this.lavora(s);
+    });
+    if (cambiato || this.lista.length !== prima) { this.salva(); this.disegna(); }
+  },
+  togli(progetto, sid) {
+    const s = this.lista.find((x) => x.progetto === progetto && x.sessione === sid);
+    if (!s) return;
+    this.lista.splice(this.lista.indexOf(s), 1);
+    if (s === this.attiva) this.attiva = null;
+    this.salva();
+    this.disegna();
+  },
+  chiudi(s) {
+    const i = this.lista.indexOf(s);
+    if (i < 0) return;
+    this.lista.splice(i, 1);
+    const eraAttiva = s === this.attiva;
+    if (eraAttiva) this.attiva = null;
+    this.salva();
+    this.disegna();
+    if (!eraAttiva) return;
+    const v = this.lista[i] || this.lista[i - 1];
+    if (v) vaiA(v.progetto, v.sessione, v.titolo, v.chiave);
+    else { apriChat(null); caricaChat(); }
+  },
+  disegna() {
+    const fuoco = el.schede.contains(document.activeElement) ? document.activeElement.closest('.scheda')?.dataset.id : null;
+    el.schede.hidden = !this.lista.length;
+    el.schede.replaceChildren(...this.lista.map((s) => {
+      const lavora = this.lavora(s);
+      const nodo = document.createElement('div');
+      nodo.className = 'scheda' + (s === this.attiva ? ' attiva' : '') + (s.finita ? ' finita' : '');
+      nodo.dataset.id = s.id;
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = 'sc-tab';
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', s === this.attiva ? 'true' : 'false');
+      tab.tabIndex = s === (this.attiva || this.lista[0]) ? 0 : -1;
+      tab.title = `${s.titolo} (${s.progetto})`;
+      tab.setAttribute('aria-label', `${s.titolo}, progetto ${s.progetto}${lavora ? ', al lavoro' : ''}${s.finita ? ', ha finito' : ''}`);
+      const titolo = document.createElement('span');
+      titolo.textContent = s.titolo.length > 22 ? s.titolo.slice(0, 21).trimEnd() + '…' : s.titolo;
+      const progetto = document.createElement('span');
+      progetto.className = 'sc-progetto';
+      progetto.textContent = s.progetto;
+      if (lavora) {
+        const punto = document.createElement('span');
+        punto.className = 'sc-punto';
+        punto.textContent = '●';
+        tab.append(punto);
+      }
+      tab.append(titolo, progetto);
+      tab.addEventListener('click', () => { if (s !== this.attiva) vaiA(s.progetto, s.sessione, s.titolo, s.chiave); });
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'sc-chiudi';
+      x.textContent = '✕';
+      x.title = 'Chiudi la scheda (la chat resta)';
+      x.setAttribute('aria-label', `Chiudi la scheda ${s.titolo}`);
+      x.addEventListener('click', () => this.chiudi(s));
+      nodo.append(tab, x);
+      return nodo;
+    }));
+    if (fuoco) el.schede.querySelector(`[data-id="${fuoco}"] .sc-tab`)?.focus();
+    el.schede.querySelector('.attiva')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  },
+};
+el.schede.addEventListener('keydown', (e) => {
+  const passo = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+  if (!passo && e.key !== 'Home' && e.key !== 'End') return;
+  const tab = [...el.schede.querySelectorAll('.sc-tab')];
+  const i = tab.indexOf(document.activeElement);
+  if (i < 0) return;
+  e.preventDefault();
+  const j = e.key === 'Home' ? 0 : e.key === 'End' ? tab.length - 1 : (i + passo + tab.length) % tab.length;
+  tab.forEach((t, k) => (t.tabIndex = k === j ? 0 : -1));
+  tab[j].focus();
+});
+
 // ---- bozze: quello che è scritto e non inviato, per progetto e chat ----
 const bozza = {
   chiave: () => `a2p-bozza-${stato.progetto}-${stato.sessione || 'nuova'}`,
@@ -169,15 +336,20 @@ function avvisoFinito(m) {
   el.avvisi.append(b);
   setTimeout(togli, 8000);
 }
-async function apriDaAvviso(m) {
-  if (m.progetto !== stato.progetto) {
-    el.progetto.value = m.progetto;
-    stato.progetto = m.progetto;
-    try { localStorage.setItem('a2p-progetto', m.progetto); } catch {}
+async function apriDaAvviso(m) { await vaiA(m.progetto, m.sessione, m.titolo); }
+
+// Porta la finestra su una chat, cambiando progetto se serve.
+async function vaiA(progetto, sessione, titolo, chiave) {
+  const vai = ++stato.vai;
+  if (progetto !== stato.progetto) {
+    if (![...el.progetto.options].some((o) => o.value === progetto)) return;
+    el.progetto.value = progetto;
+    stato.progetto = progetto;
+    try { localStorage.setItem('a2p-progetto', progetto); } catch {}
     await caricaChat();
+    if (vai !== stato.vai) return;
   }
-  if (m.sessione) apriChat(m.sessione, m.titolo);
-  else cambiaProgetto();
+  apriChat(sessione, titolo, chiave);
 }
 const titoloNormale = () => { document.title = TITOLO; };
 window.addEventListener('focus', titoloNormale);
@@ -209,6 +381,7 @@ function ricevi(m) {
   switch (m.tipo) {
     case 'in_corso':
       stato.inCorso = m.chat;
+      schede.sincronizza(m.chat);
       segniInCorso();
       break;
     case 'lavora':
@@ -227,6 +400,8 @@ function ricevi(m) {
       indicatore(true);
       break;
     case 'chat_finita':
+      schede.sincronizza([m]);
+      schede.finita(m);
       if (m.progetto !== stato.progetto || m.sessione !== stato.sessione) avvisoFinito(m);
       break;
     case 'pronto':
@@ -254,6 +429,7 @@ function ricevi(m) {
     case 'sessione':
       if (m.id && m.id !== stato.sessione) {
         const vecchia = bozza.chiave();
+        schede.assegna(m.id);
         stato.sessione = m.id;
         stato.chiave = null;
         if (el.testo.value) { bozza.salva(); bozza.cancella(vecchia); }  // la bozza della chat nuova segue la chat
@@ -358,7 +534,8 @@ async function cambiaProgetto() {
 
 async function caricaChat() {
   if (!stato.progetto) return [];
-  const chat = await api(`/api/chat?${q(stato.progetto)}`);
+  const progetto = stato.progetto;
+  const chat = await api(`/api/chat?${q(progetto)}`);
   el.elenco.innerHTML = '';
   for (const c of chat) {
     const a = document.createElement('a');
@@ -388,14 +565,24 @@ async function caricaChat() {
     a.addEventListener('click', (e) => e.preventDefault());
     el.elenco.prepend(a);
   }
+  schede.aggiorna(progetto, chat);
   segniInCorso();
   return chat;
 }
 
 async function apriChat(sid, titolo, chiave) {
+  // Messaggi scritti mentre la chat si avviava e non ancora partiti: appartengono a quella chat, non a
+  // quella che si apre ora. Tornano bozza dove erano stati scritti.
+  const nonPartiti = stato.inAttesa.filter((d) => d.tipo === 'messaggio');
+  stato.inAttesa = stato.inAttesa.filter((d) => d.tipo !== 'messaggio');
+  if (nonPartiti.length && stato.bozzaInAttesa) {
+    try { localStorage.setItem(stato.bozzaInAttesa, nonPartiti.map((d) => d.testo).join('\n\n')); } catch {}
+  }
   const apertura = ++stato.apertura;
+  stato.vai++;
   stato.sessione = sid;
   stato.chiave = sid ? null : (chiave || crypto.randomUUID());
+  schede.attivaChat(stato.progetto, sid, titolo, stato.chiave);
   ultimaChat.salva(stato.progetto, sid);
   stato.bolla = null;
   stato.passi = null;
@@ -430,6 +617,7 @@ async function apriChat(sid, titolo, chiave) {
 async function eliminaChat(c) {
   if (!confirm(`Eliminare la chat «${c.titolo}»? Non si può annullare.`)) return;
   await api(`/api/chat/${c.id}?${q(stato.progetto)}`, { method: 'DELETE' });
+  schede.togli(stato.progetto, c.id);
   if (c.id === stato.sessione) apriChat(null);
   caricaChat();
 }
@@ -477,6 +665,7 @@ el.form.addEventListener('submit', (e) => {
     if (!stato.sessione) {
       stato.titoloProvvisorio = (testo || 'Allegati').slice(0, 70);
       el.titolo.textContent = stato.titoloProvvisorio;
+      schede.scrivi(stato.titoloProvvisorio);
     }
     stato.bolla = null;
     stato.passi = null;
@@ -487,7 +676,8 @@ el.form.addEventListener('submit', (e) => {
   bozza.cancella();
   stato.allegati = [];
   mostraAllegati();
-  if (stato.pronto) invia(dati); else stato.inAttesa.push(dati);
+  if (stato.pronto) invia(dati);
+  else { stato.bozzaInAttesa = bozza.chiave(); stato.inAttesa.push(dati); }
 });
 el.testo.addEventListener('input', () => bozza.salva());
 el.testo.addEventListener('keydown', (e) => {
@@ -501,7 +691,11 @@ $('#permessi').addEventListener('change', () => {
   api('/api/impostazioni', { method: 'POST', body: JSON.stringify({ permessi: modo }) }).catch(() => {});
 });
 el.progetto.addEventListener('change', cambiaProgetto);
-$('#nuova-chat').addEventListener('click', () => { apriChat(null); caricaChat(); });
+$('#nuova-chat').addEventListener('click', () => {
+  if (schede.attiva?.vuota && !schede.attiva.sessione) return;  // già su una chat nuova e vuota
+  apriChat(null);
+  caricaChat();
+});
 el.file.addEventListener('change', () => { caricaFile([...el.file.files]); el.file.value = ''; });
 el.testo.addEventListener('paste', (e) => {
   const immagini = [...e.clipboardData.files];
@@ -686,6 +880,7 @@ $('#prova-avviso').addEventListener('click', async () => {
 (async () => {
   const s = await caricaStato();
   connetti();
+  schede.ripristina();
   await caricaProgetti();
   if (!s.chiave) $('#dlg-impostazioni').showModal();
 })();

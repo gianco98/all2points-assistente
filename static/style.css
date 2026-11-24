@@ -77,7 +77,22 @@ select, input, textarea { background: var(--pannello); border: 1px solid var(--b
 #contesto.pieno { color: #c53030; font-weight: 600; }
 
 /* ---- area chat ---- */
-main { display: grid; grid-template-rows: auto 1fr auto auto; min-height: 0; min-width: 0; }
+main { display: grid; grid-template-rows: auto auto 1fr auto auto; min-height: 0; min-width: 0; }
+#schede { display: flex; gap: .3rem; padding: .4rem 1.5rem 0; overflow-x: auto; scrollbar-width: thin; background: var(--sfondo); border-bottom: 1px solid var(--bordo); }
+#schede[hidden] { display: none; }
+.scheda { flex: none; display: flex; align-items: center; border: 1px solid var(--bordo); border-bottom: 0; border-radius: 8px 8px 0 0; background: var(--strumento); }
+.scheda.attiva { background: var(--pannello); margin-bottom: -1px; padding-bottom: 1px; }
+.scheda button { border: 0; background: none; border-radius: 0; padding: .35em .5em; font-size: .85em; }
+.scheda .sc-tab { display: flex; align-items: baseline; gap: .45em; padding-right: .2em; border-radius: 8px 0 0 0; }
+.scheda .sc-progetto { font-size: .8em; color: var(--tenue); max-width: 9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scheda .sc-punto { color: #3d8f00; }
+.scheda .sc-chiudi { color: var(--tenue); padding: .35em .5em; border-radius: 0 8px 0 0; }
+.scheda .sc-chiudi:hover { color: var(--testo); }
+.scheda button:focus-visible { outline: 2px solid var(--testo); outline-offset: -2px; }
+.scheda.finita { box-shadow: inset 0 -3px 0 var(--accento); animation: finita 1.4s ease-in-out infinite; }
+@keyframes finita { 50% { background: color-mix(in srgb, var(--accento) 45%, var(--strumento)); } }
+@media (prefers-color-scheme: dark) { .scheda .sc-punto { color: var(--accento); } }
+@media (prefers-reduced-motion: reduce) { .scheda.finita { animation: none; background: color-mix(in srgb, var(--accento) 45%, var(--strumento)); } }
 header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: .9rem 1.5rem; border-bottom: 1px solid var(--bordo); background: var(--pannello); }
 header h1 { font-size: 1.05rem; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comandi { display: flex; align-items: center; gap: .8rem; }
@@ -173,5 +188,6 @@ body.con-anteprima { grid-template-columns: 280px 1fr minmax(360px, 40%); }
 
 @media (max-width: 760px) {
   body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  #schede { padding-inline: .6rem; }
   #lato { max-height: 40vh; }
 }

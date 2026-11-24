@@ -978,7 +978,7 @@ def chat_aperte() -> list["Chat"]:
 
 
 def elenco_in_corso() -> list[dict]:
-    return [{"progetto": c.nome_progetto, "sessione": c.sid} for c in chat_aperte() if c.lavora]
+    return [{"progetto": c.nome_progetto, "sessione": c.sid, "chiavi": sorted(c.chiavi)} for c in chat_aperte() if c.lavora]
 
 
 async def aggiorna_in_corso() -> None:
@@ -1369,7 +1369,7 @@ class Chat:
         except Exception:
             pass
         titolo = (titolo or self.primo_testo or "Chat")[:60]
-        await a_tutte(tipo="chat_finita", progetto=self.nome_progetto, sessione=self.sid, titolo=titolo)
+        await a_tutte(tipo="chat_finita", progetto=self.nome_progetto, sessione=self.sid, titolo=titolo, chiavi=sorted(self.chiavi))
         if durata > AVVISO_TELEFONO_DOPO_SECONDI:
             await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{self.nome_progetto}».")
 
