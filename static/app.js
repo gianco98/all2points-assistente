@@ -5,9 +5,11 @@ const el = {
   form: $('#scrivi'), invia: $('#invia'), stop: $('#stop'), modello: $('#modello'), costo: $('#costo'),
   titolo: $('#titolo-chat'), allegati: $('#allegati'), file: $('#file'), strumenti: $('#strumenti'),
   spesaMese: $('#spesa-mese'), contesto: $('#contesto'),
+  anteprima: $('#anteprima'), anteprimaFile: $('#anteprima-file'), anteprimaFrame: $('#anteprima-frame'),
+  anteprimaMessaggio: $('#anteprima-messaggio'), anteprimaUrl: $('#anteprima-url'),
 };
 
-let stato = { progetto: null, sessione: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [] };
+let stato = { progetto: null, sessione: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null };
 
 // ---- comandi dichiarativi per i <dialog> (fallback per browser senza Invoker Commands) ----
 if (!('commandForElement' in HTMLButtonElement.prototype)) {
@@ -69,6 +71,25 @@ function aggiungi(classe, contenuto, html = false) {
   el.messaggi.append(d);
   scorri();
   return d;
+}
+// Riquadro «Passi»: la lista di Claude, aggiornata sul posto. Crea il riquadro se non c'è, altrimenti lo riscrive.
+function disegnaPassi(passi, nodo) {
+  if (!nodo) {
+    el.messaggi.querySelector('.vuoto')?.remove();
+    nodo = document.createElement('div');
+    nodo.className = 'passi';
+    const titolo = document.createElement('strong');
+    titolo.textContent = 'Passi';
+    nodo.append(titolo, document.createElement('ul'));
+    el.messaggi.append(nodo);
+  }
+  nodo.querySelector('ul').replaceChildren(...passi.map((p) => {
+    const li = document.createElement('li');
+    li.className = p.stato;
+    li.textContent = p.testo;
+    return li;
+  }));
+  return nodo;
 }
 function indicatore(acceso) {
   el.messaggi.querySelector('.lavoro')?.remove();
@@ -145,6 +166,18 @@ function ricevi(m) {
       indicatore(false);
       aggiungi('strumento' + (m.sotto ? ' sotto' : ''), '⚙ ' + m.testo);
       indicatore(true);
+      break;
+    case 'passi': {
+      indicatore(false);
+      const nuovo = !stato.passi;
+      stato.passi = disegnaPassi(m.passi, stato.passi);
+      if (nuovo) stato.bolla = null;
+      scorri();
+      indicatore(true);
+      break;
+    }
+    case 'file_anteprima':
+      fileAnteprima(m.percorso, true);
       break;
     case 'permesso':
       indicatore(false);
@@ -253,7 +286,9 @@ async function apriChat(sid, titolo) {
   stato.sessione = sid;
   ultimaChat.salva(stato.progetto, sid);
   stato.bolla = null;
+  stato.passi = null;
   stato.pronto = false;
+  azzeraAnteprima();
   el.costo.textContent = '';
   el.contesto.textContent = '';
   el.titolo.textContent = titolo || 'Nuova chat';
@@ -262,9 +297,12 @@ async function apriChat(sid, titolo) {
   if (sid) {
     const righe = await api(`/api/chat/${sid}?${q(stato.progetto)}`);
     if (righe.length) el.messaggi.innerHTML = '';
+    let passi = null;  // più aggiornamenti della lista tra due messaggi dell'utente restano un riquadro solo
     for (const r of righe) {
-      if (r.ruolo === 'user') aggiungi('msg utente', r.testo.replace(/\n\nAllegati \(leggili con Read\):[\s\S]*$/, ' 📎'));
+      if (r.ruolo === 'user') { passi = null; aggiungi('msg utente', r.testo.replace(/\n\nAllegati \(leggili con Read\):[\s\S]*$/, ' 📎')); }
       else if (r.ruolo === 'assistant') aggiungi('msg claude', markdown(r.testo), true);
+      else if (r.ruolo === 'passi') passi = disegnaPassi(r.passi, passi);
+      else if (r.ruolo === 'file') fileAnteprima(r.percorso, false);
       else aggiungi('strumento', '⚙ ' + r.testo);
     }
     caricaChat();
@@ -325,6 +363,7 @@ el.form.addEventListener('submit', (e) => {
   stato.allegati = [];
   mostraAllegati();
   stato.bolla = null;
+  stato.passi = null;
   inLavoro(true);
   if (stato.titoloProvvisorio && !stato.sessione) caricaChat();
   if (stato.pronto) invia(dati); else stato.inAttesa.push(dati);
@@ -349,6 +388,60 @@ el.testo.addEventListener('paste', (e) => {
 el.form.addEventListener('dragover', (e) => { e.preventDefault(); el.form.classList.add('trascina'); });
 el.form.addEventListener('dragleave', () => el.form.classList.remove('trascina'));
 el.form.addEventListener('drop', (e) => { e.preventDefault(); el.form.classList.remove('trascina'); caricaFile([...e.dataTransfer.files]); });
+
+// ---- anteprima ----
+const anteprima = { file: [], vista: null, autoFatto: false };
+function mostraPannello(si) {
+  el.anteprima.hidden = !si;
+  document.body.classList.toggle('con-anteprima', si);
+}
+function messaggioAnteprima(testo = '') { el.anteprimaMessaggio.textContent = testo; }
+function disegnaElencoFile() {
+  const voci = anteprima.file.map((p) => new Option(p, p));
+  el.anteprimaFile.replaceChildren(...(voci.length ? voci : [Object.assign(new Option('Nessun file ancora', ''), { disabled: true })]));
+  if (anteprima.vista?.file) el.anteprimaFile.value = anteprima.vista.file;
+  else el.anteprimaFile.selectedIndex = voci.length ? -1 : 0;
+}
+function mostraFile(percorso) {
+  const indirizzo = percorso.split('/').map(encodeURIComponent).join('/');
+  anteprima.vista = { file: percorso };
+  el.anteprimaFile.value = percorso;
+  messaggioAnteprima();
+  el.anteprimaFrame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups');
+  el.anteprimaFrame.src = `/anteprima/${encodeURIComponent(stato.progetto)}/${indirizzo}?t=${Date.now()}`;
+}
+function fileAnteprima(percorso, dalVivo) {
+  if (!anteprima.file.includes(percorso)) { anteprima.file.push(percorso); disegnaElencoFile(); }
+  if (!dalVivo) return;
+  if (!anteprima.autoFatto) { anteprima.autoFatto = true; mostraPannello(true); mostraFile(percorso); }
+  else if (anteprima.vista?.file === percorso) mostraFile(percorso);
+}
+function azzeraAnteprima() {
+  Object.assign(anteprima, { file: [], vista: null, autoFatto: false });
+  el.anteprimaFrame.src = 'about:blank';
+  messaggioAnteprima();
+  disegnaElencoFile();
+}
+function mostraIndirizzo(testo) {
+  const m = testo.trim().match(/^http:\/\/(localhost|127\.0\.0\.1):(\d+)(\/.*)?$/);
+  if (!m || Number(m[2]) === Number(location.port)) {
+    messaggioAnteprima('Scrivi l\'indirizzo di un sito aperto sul tuo computer, per esempio http://localhost:3000 (non quello di questa app).');
+    return;
+  }
+  anteprima.vista = { url: m[0] };
+  el.anteprimaFile.selectedIndex = -1;
+  messaggioAnteprima();
+  el.anteprimaFrame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
+  el.anteprimaFrame.src = m[0];
+}
+$('#apri-anteprima').addEventListener('click', () => mostraPannello(el.anteprima.hidden));
+$('#anteprima-chiudi').addEventListener('click', () => mostraPannello(false));
+el.anteprimaFile.addEventListener('change', () => el.anteprimaFile.value && mostraFile(el.anteprimaFile.value));
+$('#anteprima-ricarica').addEventListener('click', () => {
+  if (anteprima.vista?.file) mostraFile(anteprima.vista.file);
+  else if (anteprima.vista?.url) mostraIndirizzo(anteprima.vista.url);
+});
+$('#anteprima-indirizzo').addEventListener('submit', (e) => { e.preventDefault(); mostraIndirizzo(el.anteprimaUrl.value); });
 
 // ---- finestre ----
 $('#form-progetto').addEventListener('submit', async (e) => {

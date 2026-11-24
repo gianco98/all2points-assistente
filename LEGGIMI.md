@@ -41,6 +41,8 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
   - **Automatico** (predefinito): Claude valuta il rischio di ogni azione, fa da solo comandi e modifiche sicure e blocca quelle pericolose (cancellazioni pesanti, pubblicazioni…); chiede solo nei casi dubbi.
   - **Chiedi conferma**: comandi e modifiche ai file chiedono sempre «Consenti» o «Nega».
   - In tutte e due le modalità lettura, skill, DaVinci, browser e avvisi vanno da soli.
+- **Passi:** quando Claude lavora con una lista di cose da fare, sotto il messaggio compare il riquadro «Passi», che si aggiorna da solo: ✓ fatto, ◐ in corso, ○ da fare.
+- **Anteprima:** il bottone «Anteprima» in alto apre un pannello a destra con le pagine web (.html) e le immagini (.png, .jpg, .gif, .webp, .svg) che Claude crea nella chat; si apre da solo alla prima. Si vedono solo file della cartella del progetto. Per un sito già acceso sul tuo computer (es. `http://localhost:3000`) scrivi l'indirizzo nel campo e premi «Apri».
 - **Versione:** è indicata in basso a sinistra.
 
 ## Browser

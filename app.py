@@ -33,7 +33,7 @@ from pathlib import Path
 import keyring
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from claude_agent_sdk import (
@@ -44,7 +44,9 @@ from claude_agent_sdk import (
     StreamEvent,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     create_sdk_mcp_server,
     delete_session,
     get_session_messages,
@@ -81,6 +83,11 @@ SENZA_CONFERMA = (
     "Read", "Glob", "Grep", "Skill", "TodoWrite", "WebSearch", "WebFetch", "Task", "Agent",
     "mcp__davinci__", "mcp__browser__", "mcp__avvisi__",
 )
+# Lista dei passi (todo list) e file che il riquadro «Anteprima» sa mostrare.
+STRUMENTI_TODO = ("TodoWrite",)
+STRUMENTI_FILE = ("Write", "Edit", "MultiEdit")
+ESTENSIONI_ANTEPRIMA = {".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+STATI_PASSI = {"completed": "fatto", "in_progress": "in_corso"}
 KEYRING = ("all2points-assistente", "anthropic")
 KEYRING_ESTENSIONE = ("all2points-assistente", "playwright-extension")
 
@@ -780,8 +787,36 @@ async def messaggi(sid: str, progetto: str):
             if blocco.get("type") == "text" and blocco.get("text", "").strip():
                 righe.append({"ruolo": m.type, "testo": blocco["text"]})
             elif blocco.get("type") == "tool_use":
-                righe.append({"ruolo": "strumento", "testo": riassumi_strumento(blocco.get("name", ""), blocco.get("input") or {})})
+                nome, dati = blocco.get("name", ""), blocco.get("input") or {}
+                if nome in STRUMENTI_TODO:
+                    righe.append({"ruolo": "passi", "passi": passi_da_todo(dati)})
+                    continue
+                righe.append({"ruolo": "strumento", "testo": riassumi_strumento(nome, dati)})
+                rel = percorso_anteprima(nome, dati, cartella)
+                if rel:
+                    righe.append({"ruolo": "file", "percorso": rel})
     return righe
+
+
+@app.get("/anteprima/{progetto}/{percorso:path}")
+async def anteprima(progetto: str, percorso: str):
+    """Un file della cartella di lavoro per il riquadro «Anteprima». La pagina gira in un sandbox senza
+    origine (niente allow-same-origin): non può chiamare le API dell'app né leggere altri file."""
+    base = cartella_lavoro(progetto).resolve()
+    if "\\" in percorso or "\x00" in percorso:
+        raise HTTPException(404, "File non trovato")
+    try:
+        file = (base / percorso).resolve()
+        dentro = file.is_relative_to(base) and file.is_file()
+    except (OSError, ValueError):
+        dentro = False
+    if not dentro:
+        raise HTTPException(404, "File non trovato")
+    return FileResponse(file, headers={
+        "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    })
 
 
 @app.post("/api/chat/{sid}/rinomina")
@@ -823,6 +858,31 @@ def spiega_errore(testo: str) -> str:
     return str(testo)
 
 
+def passi_da_todo(dati: dict) -> list[dict]:
+    """La lista completa di TodoWrite come la mostra l'interfaccia: testo e stato (fatto, in_corso, da_fare)."""
+    passi = []
+    for voce in dati.get("todos") or []:
+        if not isinstance(voce, dict):
+            continue
+        stato_passo = STATI_PASSI.get(voce.get("status"), "da_fare")
+        testo = (voce.get("activeForm") if stato_passo == "in_corso" else None) or voce.get("content")
+        if testo:
+            passi.append({"testo": str(testo), "stato": stato_passo})
+    return passi
+
+
+def percorso_anteprima(nome: str, dati: dict, lavoro: Path) -> str | None:
+    """Se lo strumento scrive una pagina o un'immagine dentro la cartella di lavoro, il suo percorso relativo."""
+    grezzo = dati.get("file_path")
+    if nome not in STRUMENTI_FILE or not isinstance(grezzo, str) or Path(grezzo).suffix.lower() not in ESTENSIONI_ANTEPRIMA:
+        return None
+    try:
+        base = lavoro.resolve()
+        return (base / grezzo).resolve().relative_to(base).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 def riassumi_strumento(nome: str, dati: dict) -> str:
     etichette = {
         "Read": "Legge", "Write": "Scrive", "Edit": "Modifica", "Bash": "Comando",
@@ -849,7 +909,7 @@ async def sessione(ws: WebSocket):
     ATTIVITA["finestre"] += 1
 
     stato = {"client": None, "progetto": None, "consentiti": set(), "costo": 0.0, "lavoro": None,
-             "connettori": [], "mcp": {}, "collego": set(), "controllo": None}
+             "connettori": [], "mcp": {}, "collego": set(), "controllo": None, "cartella_lavoro": None}
     richieste: dict[str, asyncio.Future] = {}
     compiti: set[asyncio.Task] = set()
 
@@ -923,11 +983,12 @@ async def sessione(ws: WebSocket):
             include_partial_messages=True,
             resume=sid,
             add_dirs=[str(BASE), *([str(cartella)] if lavoro != cartella else []), *extra],
-            env={"ANTHROPIC_API_KEY": k},
+            # Il motore in modalità SDK non offre la lista dei passi se non glielo si chiede: TodoWrite, non Task*.
+            env={"ANTHROPIC_API_KEY": k, "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1", "CLAUDE_CODE_ENABLE_TASKS": "0"},
         )
         client = ClaudeSDKClient(options=opzioni)
         await client.connect()
-        stato.update(client=client, progetto=cartella, consentiti=set(), costo=0.0)
+        stato.update(client=client, progetto=cartella, cartella_lavoro=lavoro, consentiti=set(), costo=0.0)
         await invia(tipo="pronto", davinci=bool(davinci), browser=bool(browser))
         stato["controllo"] = asyncio.create_task(controlla_connettori(client))
         if sid:
@@ -999,6 +1060,7 @@ async def sessione(ws: WebSocket):
         client = stato["client"]
         inizio = time.monotonic()
         costo_prima = stato["costo"]
+        anteprime: dict[str, str] = {}  # tool_use_id -> file da mostrare quando la scrittura riesce
         try:
             await client.query(testo)
             async for m in client.receive_response():
@@ -1010,8 +1072,19 @@ async def sessione(ws: WebSocket):
                         await invia(tipo="testo", testo=ev["delta"]["text"])
                 elif isinstance(m, AssistantMessage):
                     for b in m.content:
-                        if isinstance(b, ToolUseBlock):
-                            await invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(m.parent_tool_use_id))
+                        if not isinstance(b, ToolUseBlock):
+                            continue
+                        if not m.parent_tool_use_id and b.name in STRUMENTI_TODO:
+                            await invia(tipo="passi", passi=passi_da_todo(b.input))
+                            continue
+                        await invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(m.parent_tool_use_id))
+                        rel = None if m.parent_tool_use_id else percorso_anteprima(b.name, b.input, stato["cartella_lavoro"])
+                        if rel:
+                            anteprime[b.id] = rel
+                elif isinstance(m, UserMessage) and not m.parent_tool_use_id and isinstance(m.content, list):
+                    for b in m.content:
+                        if isinstance(b, ToolResultBlock) and not b.is_error and b.tool_use_id in anteprime:
+                            await invia(tipo="file_anteprima", percorso=anteprime.pop(b.tool_use_id))
                 elif isinstance(m, SystemMessage) and m.subtype == "init":
                     ricorda_chat(stato["progetto"], m.data.get("session_id"))
                     await invia(tipo="sessione", id=m.data.get("session_id"))

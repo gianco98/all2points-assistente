@@ -95,6 +95,16 @@ header h1 { font-size: 1.05rem; margin: 0; overflow: hidden; text-overflow: elli
 .msg pre code { background: none; padding: 0; }
 .strumento { align-self: flex-start; font-size: .82em; line-height: 1.5; color: var(--tenue); background: var(--strumento); border-radius: 99px; padding: .3em .8em; max-width: 92%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .strumento.sotto { margin-left: 1.2rem; opacity: .8; }
+.passi { align-self: flex-start; max-width: min(760px, 92%); font-size: .9em; line-height: 1.5; background: var(--strumento); border-radius: var(--raggio); padding: .6rem .9rem; }
+.passi strong { display: block; font-size: .82em; text-transform: uppercase; letter-spacing: .06em; color: var(--tenue); margin-bottom: .2rem; }
+.passi ul { list-style: none; margin: 0; padding: 0; }
+.passi li { padding-left: 1.5em; text-indent: -1.5em; overflow-wrap: anywhere; }
+.passi li::before { display: inline-block; width: 1.5em; text-indent: 0; text-decoration: none; }
+.passi li.da_fare::before { content: "○"; color: var(--tenue); }
+.passi li.in_corso { font-weight: 700; }
+.passi li.in_corso::before { content: "◐"; color: #b7791f; }
+.passi li.fatto { color: var(--tenue); text-decoration: line-through; }
+.passi li.fatto::before { content: "✓"; }
 .errore { color: var(--pericolo); }
 .msg.errore { border-color: var(--pericolo); }
 .vuoto { margin: auto; text-align: center; color: var(--tenue); max-width: 520px; line-height: 1.6; }
@@ -134,6 +144,23 @@ fieldset:has(input[value="separato"]:checked) .sotto-scelta { display: none; }
 dialog { max-height: 92vh; overflow-y: auto; }
 .nota { font-size: .85em; color: var(--tenue); margin: 0; }
 .azioni { display: flex; justify-content: flex-end; gap: .5rem; flex-wrap: wrap; }
+
+/* ---- anteprima ---- */
+body.con-anteprima { grid-template-columns: 280px 1fr minmax(360px, 40%); }
+#anteprima { display: flex; flex-direction: column; gap: .5rem; height: 100vh; min-height: 0; min-width: 0; padding: .8rem; background: var(--pannello); border-left: 1px solid var(--bordo); }
+#anteprima[hidden] { display: none; }
+.anteprima-testa { display: flex; justify-content: space-between; align-items: center; }
+.anteprima-barra { display: flex; gap: .5rem; margin: 0; }
+.anteprima-barra select, .anteprima-barra input { flex: 1; min-width: 0; }
+#anteprima-messaggio { margin: 0; }
+#anteprima-messaggio:empty { display: none; }
+#anteprima-frame { flex: 1; min-height: 0; width: 100%; border: 1px solid var(--bordo); border-radius: 8px; background: #fff; }
+
+@media (max-width: 900px) {
+  body.con-anteprima { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 50vh) minmax(0, 1fr); }
+  body.con-anteprima #anteprima { order: 1; height: auto; border-left: 0; border-bottom: 1px solid var(--bordo); }
+  body.con-anteprima main { order: 2; }
+}
 
 @media (max-width: 760px) {
   body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }

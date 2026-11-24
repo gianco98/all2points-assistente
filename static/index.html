@@ -43,6 +43,7 @@
         <option value="auto">Permessi: automatico</option>
         <option value="chiedi">Permessi: chiedi conferma</option>
       </select>
+      <button type="button" id="apri-anteprima" class="secondario" title="Mostra pagine e immagini create da Claude">Anteprima</button>
       <span id="contesto" class="spesa"></span>
       <span id="costo" class="spesa" title="Spesa di questa chat"></span>
     </div>
@@ -62,6 +63,23 @@
     </div>
   </form>
 </main>
+
+<aside id="anteprima" hidden aria-label="Anteprima">
+  <div class="anteprima-testa">
+    <strong>Anteprima</strong>
+    <button type="button" id="anteprima-chiudi" class="icona secondario" title="Chiudi" aria-label="Chiudi anteprima">✕</button>
+  </div>
+  <div class="anteprima-barra">
+    <select id="anteprima-file" aria-label="File toccati in questa chat"></select>
+    <button type="button" id="anteprima-ricarica" class="icona secondario" title="Ricarica" aria-label="Ricarica">↻</button>
+  </div>
+  <form id="anteprima-indirizzo" class="anteprima-barra">
+    <input id="anteprima-url" placeholder="http://localhost:3000" autocomplete="off" aria-label="Indirizzo di un sito sul tuo computer">
+    <button class="secondario">Apri</button>
+  </form>
+  <p id="anteprima-messaggio" class="nota" role="status"></p>
+  <iframe id="anteprima-frame" title="Anteprima" sandbox="allow-scripts allow-forms allow-popups"></iframe>
+</aside>
 
 <dialog id="dlg-progetto">
   <form method="dialog" id="form-progetto">
