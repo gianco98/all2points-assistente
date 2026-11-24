@@ -960,6 +960,7 @@ class Finestra:
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.chat: "Chat | None" = None
+        self.apertura: asyncio.Task | None = None  # l'«apri» in corso: non blocca il ciclo della websocket
         self._invio = asyncio.Lock()
 
     async def invia(self, **dati) -> None:
@@ -1034,6 +1035,7 @@ class Chat:
         self.browser = False
         self.compiti: set[asyncio.Task] = set()
         self.lettore: asyncio.Task | None = None
+        self.avvio: asyncio.Task | None = None  # l'avvio del motore: vive anche se la finestra cambia idea a metà
         self.task_attivi: set[str] = set()  # agenti e comandi in background ancora al lavoro
 
     # ----- avvio e chiusura -----
@@ -1136,11 +1138,12 @@ class Chat:
     async def invia(self, **dati) -> None:
         await asyncio.gather(*(f.invia(**dati) for f in list(self.spettatori)))
 
-    async def aggancia(self, finestra: Finestra, modello: str, permessi: str) -> None:
-        # «pronto» prima di agganciarsi: la finestra ignora gli eventi della chat precedente fino a qui.
-        await finestra.invia(tipo="pronto", davinci=self.davinci, browser=self.browser)
-        self.spettatori.add(finestra)
+    async def aggancia(self, finestra: Finestra, modello: str, permessi: str, apertura=None) -> None:
+        # La finestra risulta sulla chat prima di «pronto»: i messaggi che manda subito dopo trovano la chat.
+        # «pronto» porta il numero dell'apertura, così la finestra scarta quello di un'apertura superata.
         finestra.chat = self
+        await finestra.invia(tipo="pronto", davinci=self.davinci, browser=self.browser, apertura=apertura)
+        self.spettatori.add(finestra)
         self.ultima = time.monotonic()
         if self.client and modello != self.modello:
             self.modello = modello
@@ -1441,10 +1444,15 @@ class Chat:
                 await self.invia(tipo="errore", testo=f"Collegamento a {voce['nome']} non riuscito o annullato.")
 
 
+def _avvio_finito(chat: "Chat", compito: asyncio.Task) -> None:
+    if not compito.cancelled():
+        compito.exception()  # l'errore lo racconta chi aspettava l'avvio; qui si evita solo l'avviso «mai letto»
+    chat.forse_chiudi()  # se nel frattempo la finestra è andata altrove, la chat non resta aperta per sempre
+
+
 async def apri_chat(finestra: Finestra, dati: dict) -> None:
     """La finestra guarda una chat: quella già aperta se c'è (mai due client per la stessa chat), altrimenti una nuova.
     La chat che guardava prima resta aperta e continua a lavorare."""
-    finestra.stacca()
     progetto, sid = dati["progetto"], dati.get("sessione")
     cartella = cartella_progetto(progetto)
     if sid and cartella_lavoro(progetto) != cartella:
@@ -1456,12 +1464,27 @@ async def apri_chat(finestra: Finestra, dati: dict) -> None:
     chat = CHAT.get(k)
     if chat is None:
         chat = CHAT[k] = Chat(progetto, sid, k, modello, permessi)
-        await chat.avvia()
+        chat.avvio = asyncio.create_task(chat.avvia())
+        chat.avvio.add_done_callback(lambda t, c=chat: _avvio_finito(c, t))
+    # shield: se questa apertura viene superata da un'altra, l'avvio del motore prosegue e la chat resta pronta per dopo.
+    if chat.avvio and not chat.avvio.done():
+        await asyncio.shield(chat.avvio)
     else:
         await chat.pronta.wait()
-        if chat.errore_avvio:
-            raise chat.errore_avvio
-    await chat.aggancia(finestra, modello, permessi)
+    if chat.errore_avvio:
+        raise chat.errore_avvio
+    await chat.aggancia(finestra, modello, permessi, dati.get("apertura"))
+
+
+async def apri_in_compito(finestra: Finestra, dati: dict) -> None:
+    try:
+        await apri_chat(finestra, dati)
+    except asyncio.CancelledError:
+        raise
+    except Exception as errore:
+        testo = errore.detail if isinstance(errore, HTTPException) else f"{type(errore).__name__}: {errore}"
+        await finestra.invia(tipo="errore", testo=testo)
+        await finestra.invia(tipo="lavora", si=bool(finestra.chat and finestra.chat.lavora))
 
 
 async def chiudi_chat_inattive() -> None:
@@ -1490,7 +1513,13 @@ async def sessione(ws: WebSocket):
             chat = finestra.chat
             try:
                 if tipo == "apri":
-                    await apri_chat(finestra, dati)
+                    # Non si aspetta l'avvio del motore (10-25 s): un secondo «apri» o un messaggio non restano in coda.
+                    # La finestra si aggancia solo all'ultima chat richiesta: quella precedente viene lasciata.
+                    if finestra.apertura and not finestra.apertura.done():
+                        finestra.apertura.cancel()
+                        await asyncio.gather(finestra.apertura, return_exceptions=True)
+                    finestra.stacca()
+                    finestra.apertura = asyncio.create_task(apri_in_compito(finestra, dati))
                 elif tipo == "permesso" and chat:
                     chat.rispondi_permesso(dati.get("id"), dati.get("risposta", "no"))
                 elif tipo == "messaggio":
@@ -1522,6 +1551,8 @@ async def sessione(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        if finestra.apertura and not finestra.apertura.done():
+            finestra.apertura.cancel()
         finestra.stacca()
         FINESTRE.discard(finestra)
         ATTIVITA["finestre"] = len(FINESTRE)
