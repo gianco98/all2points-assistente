@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "claude-agent-sdk",
+#   "claude-agent-sdk>=0.2.188",
 #   "keyring",
 #   "fastapi",
 #   "uvicorn",

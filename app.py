@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "claude-agent-sdk",
+#   "claude-agent-sdk>=0.2.188",
 #   "keyring",
 #   "fastapi",
 #   "uvicorn",
@@ -811,11 +811,11 @@ async def messaggi(sid: str, progetto: str):
             continue
         contenuto = (m.message or {}).get("content")
         if isinstance(contenuto, str):
-            righe.append({"ruolo": m.type, "testo": contenuto})
+            righe.append(riga_testo(m.type, contenuto))
             continue
         for blocco in contenuto or []:
             if blocco.get("type") == "text" and blocco.get("text", "").strip():
-                righe.append({"ruolo": m.type, "testo": blocco["text"]})
+                righe.append(riga_testo(m.type, blocco["text"]))
             elif blocco.get("type") == "tool_use":
                 nome, dati = blocco.get("name", ""), blocco.get("input") or {}
                 if nome in STRUMENTI_TODO:
@@ -889,6 +889,14 @@ def spiega_errore(testo: str) -> str:
     if "credit balance" in basso:
         return "Crediti API finiti: ricaricali su platform.claude.com › Billing."
     return str(testo)
+
+
+def riga_testo(ruolo: str, testo: str) -> dict:
+    """Le notifiche degli agenti in background il motore le salva come messaggi dell'utente: si mostrano come riga di servizio."""
+    if ruolo == "user" and testo.lstrip().startswith("<task-notification>"):
+        riassunto = re.search(r"<summary>(.*?)</summary>", testo, re.S)
+        return {"ruolo": "strumento", "testo": "Agente in background: " + (riassunto.group(1).strip() if riassunto else "aggiornamento")}
+    return {"ruolo": ruolo, "testo": testo}
 
 
 def passi_da_todo(dati: dict) -> list[dict]:
@@ -1333,11 +1341,13 @@ class Chat:
             self.costo = m.total_cost_usd
             ricorda_costo(self.cartella, m.session_id, m.total_cost_usd)
         self._registra_sid(m.session_id)
-        interrotto = m.is_error or (m.terminal_reason or "").startswith("aborted")
-        if interrotto or m.user_message_uuids is None:
+        # Campi delle versioni recenti dell'SDK: se mancano, la chat non si deve interrompere.
+        letti = getattr(m, "user_message_uuids", None)
+        interrotto = m.is_error or (getattr(m, "terminal_reason", None) or "").startswith("aborted")
+        if interrotto or letti is None:
             self.inviati.clear()
         else:
-            self.inviati -= set(m.user_message_uuids)
+            self.inviati -= set(letti)
         dopo, self.dopo_stop = self.dopo_stop, None
         prossimo = None
         if not self.inviati and dopo is None and not interrotto and self.coda:
