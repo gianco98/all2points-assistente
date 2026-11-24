@@ -77,7 +77,7 @@ select, input, textarea { background: var(--pannello); border: 1px solid var(--b
 #contesto.pieno { color: #c53030; font-weight: 600; }
 
 /* ---- area chat ---- */
-main { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; min-width: 0; }
+main { display: grid; grid-template-rows: auto 1fr auto auto; min-height: 0; min-width: 0; }
 header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: .9rem 1.5rem; border-bottom: 1px solid var(--bordo); background: var(--pannello); }
 header h1 { font-size: 1.05rem; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comandi { display: flex; align-items: center; gap: .8rem; }
@@ -115,6 +115,15 @@ header h1 { font-size: 1.05rem; margin: 0; overflow: hidden; text-overflow: elli
 .permesso { align-self: stretch; border: 2px solid var(--accento); border-radius: var(--raggio); padding: .9rem 1rem; background: var(--pannello); }
 .permesso pre { max-height: 220px; overflow: auto; font-size: .85em; white-space: pre-wrap; }
 .permesso.risolto { opacity: .6; border-color: var(--bordo); }
+
+#coda { margin: 0 1.5rem; padding: .6rem .9rem; background: var(--strumento); border-radius: var(--raggio); font-size: .9em; max-height: 30vh; overflow-y: auto; }
+#coda[hidden] { display: none; }
+#coda > strong { display: block; font-size: .82em; text-transform: uppercase; letter-spacing: .06em; color: var(--tenue); margin-bottom: .3rem; }
+.coda-voce { display: flex; align-items: center; gap: .4rem; padding: .25rem 0; }
+.coda-voce span { flex: 1; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.coda-voce button { padding: .25em .7em; font-size: .9em; white-space: nowrap; }
+#avvisi { position: fixed; right: 1rem; bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; align-items: flex-end; z-index: 10; }
+.avviso { max-width: 360px; text-align: left; background: var(--mio); color: var(--mio-testo); border: 0; border-left: 4px solid var(--accento); box-shadow: 0 4px 16px rgb(0 0 0 / .3); }
 
 #scrivi { padding: .8rem 1.5rem 1.2rem; background: var(--sfondo); }
 #scrivi.trascina .campo { outline: 2px dashed var(--accento); }

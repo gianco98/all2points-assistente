@@ -36,6 +36,9 @@ La **chiave API** e il codice dell'estensione Chrome sono nel portachiavi del si
   - **Progetto da una cartella esistente:** in «Nuovo progetto» scrivi anche il percorso di una cartella (un sito, un gioco Roblox, la cartella dei clienti). Claude lavora lì dentro come in Claude Code, con il `CLAUDE.md`, la memoria e le regole di quella cartella. Nell'elenco ha l'icona 📁. Si vedono solo le chat nate nell'app, non quelle di Claude Code nella stessa cartella.
   - Se in quella cartella gli hook di avvio di Claude Code sono lenti (es. graphify su una cartella grande), la prima risposta può tardare qualche minuto.
 - **Chat:** restano salvate con tutto il contesto. Si riprendono anche dopo aver spento il computer.
+- **Chat in background:** puoi cambiare chat o progetto mentre Claude lavora: il lavoro continua. Le chat al lavoro hanno il segno ● (anche accanto al progetto) e, quando una finisce, compare un avviso in basso a destra: cliccalo per aprirla. Il titolo della finestra diventa «● Assistente All2Points» finché non la apri.
+- **Coda:** se scrivi mentre Claude lavora, il messaggio non si perde: compare sotto la chat nel riquadro «In coda» e parte da solo a fine lavoro. Con i bottoni puoi toglierlo (✕), **Aggiungi al lavoro** (Claude lo legge al prossimo passo, senza fermarsi) o **Ferma e manda** (interrompe e manda subito).
+- **Bozze:** quello che scrivi nella casella e non invii resta salvato per ogni chat e si ritrova riaprendola.
 - **Modelli:** Opus per montaggio e lavori difficili, Sonnet per il lavoro normale, Haiku per le cose semplici.
 - **Permessi** (in alto, accanto al modello):
   - **Automatico** (predefinito): Claude valuta il rischio di ogni azione, fa da solo comandi e modifiche sicure e blocca quelle pericolose (cancellazioni pesanti, pubblicazioni…); chiede solo nei casi dubbi.

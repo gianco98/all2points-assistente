@@ -15,6 +15,7 @@ Gira solo sul computer di chi la usa (http://127.0.0.1:8765). Ognuno del team us
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -42,6 +43,9 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     StreamEvent,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     SystemMessage,
     TextBlock,
     ToolResultBlock,
@@ -49,12 +53,13 @@ from claude_agent_sdk import (
     UserMessage,
     create_sdk_mcp_server,
     delete_session,
+    get_session_info,
     get_session_messages,
     list_sessions,
     rename_session,
     tool,
 )
-from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import TERMINAL_TASK_STATUSES, PermissionResultAllow, PermissionResultDeny
 
 PORTA = int(os.environ.get("A2P_PORTA", "8765"))  # un'altra porta serve per provare una versione nuova
 ORIGINI = {f"http://127.0.0.1:{PORTA}", f"http://localhost:{PORTA}"}
@@ -616,7 +621,14 @@ Regole, in quest'ordine:
 
 # ---------- app web ----------
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def ciclo_vita(_app):
+    pulizia = asyncio.create_task(chiudi_chat_inattive())
+    yield
+    pulizia.cancel()
+
+
+app = FastAPI(lifespan=ciclo_vita)
 app.mount("/static", StaticFiles(directory=CODICE / "static"), name="static")
 
 
@@ -848,6 +860,9 @@ async def rinomina(sid: str, progetto: str, request: Request):
 @app.delete("/api/chat/{sid}")
 async def elimina(sid: str, progetto: str):
     chat_permessa(sid, progetto)
+    aperta = CHAT.get(sid)
+    if aperta:
+        await aperta.chiudi()
     await asyncio.to_thread(delete_session, sid, str(cartella_lavoro(progetto)))
     return {"ok": True}
 
@@ -918,261 +933,589 @@ def riassumi_strumento(nome: str, dati: dict) -> str:
     return f"{etichette.get(nome, nome)}: {str(dettaglio)[:160]}".strip(": ")
 
 
+# ---------- chat in background ----------
+
+# Una chat = un client = un processo del motore. Vive anche quando nessuna finestra la guarda:
+# così il lavoro continua cambiando chat o progetto. Le chat nuove stanno sotto la chiave temporanea
+# data dal browser; appena hanno il session_id si registrano anche sotto quello.
+CHAT: dict[str, "Chat"] = {}
+FINESTRE: set["Finestra"] = set()
+CHIUDI_CHAT_DOPO_MINUTI = 15
+CHIUDI_LASCIATA_DOPO_SECONDI = 30  # una chat ferma che nessuno guarda si chiude presto: ogni chat è un processo
+AVVISO_TELEFONO_DOPO_SECONDI = 120
+ATTESA_STOP_SECONDI = 20
+
+
+class Finestra:
+    """Una websocket aperta. Guarda una chat alla volta."""
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.chat: "Chat | None" = None
+        self._invio = asyncio.Lock()
+
+    async def invia(self, **dati) -> None:
+        async with self._invio:
+            try:
+                await self.ws.send_json(dati)
+            except Exception:
+                pass
+
+    def stacca(self) -> None:
+        if self.chat:
+            self.chat.spettatori.discard(self)
+            self.chat.ultima = time.monotonic()
+            self.chat.forse_chiudi()
+        self.chat = None
+
+
+async def a_tutte(**dati) -> None:
+    await asyncio.gather(*(f.invia(**dati) for f in list(FINESTRE)))
+
+
+def chat_aperte() -> list["Chat"]:
+    return list(dict.fromkeys(CHAT.values()))  # una chat può stare sotto due chiavi
+
+
+def elenco_in_corso() -> list[dict]:
+    return [{"progetto": c.nome_progetto, "sessione": c.sid} for c in chat_aperte() if c.lavora]
+
+
+async def aggiorna_in_corso() -> None:
+    # Anche gli agenti in background tengono acceso il motore.
+    ATTIVITA["lavori"] = sum(1 for c in chat_aperte() if c.lavora or c.task_attivi)
+    ATTIVITA["ultima"] = time.monotonic()
+    await a_tutte(tipo="in_corso", chat=elenco_in_corso())
+
+
+async def domanda(testo: str, uid: str):
+    # Il uuid permette di sapere quando il motore ha letto il messaggio (user_message_uuids del risultato).
+    yield {"type": "user", "message": {"role": "user", "content": testo}, "parent_tool_use_id": None, "uuid": uid}
+
+
+class Chat:
+    def __init__(self, progetto: str, sid: str | None, chiave_chat: str, modello: str, permessi: str):
+        self.nome_progetto = progetto
+        self.cartella = cartella_progetto(progetto)
+        self.lavoro = cartella_lavoro(progetto)
+        self.sid = sid
+        self.chiavi = {sid or chiave_chat}
+        self.modello, self.permessi = modello, permessi
+        self.client: ClaudeSDKClient | None = None
+        self.spettatori: set[Finestra] = set()
+        self.pronta = asyncio.Event()
+        self.errore_avvio: Exception | None = None
+        self.chiusa = False
+        self.ultima = time.monotonic()
+        self.lavora = False
+        self.inizio = 0.0
+        self.inviati: set[str] = set()  # uuid mandati al motore e non ancora letti
+        self.coda: list[dict] = []  # messaggi scritti mentre Claude lavora: {id, testo, completo}
+        self.dopo_stop: str | None = None  # "stop" o "riparti" (ferma e manda): cosa fare del risultato dell'interruzione
+        self.fine_turno = asyncio.Event()
+        self.costo: float | None = 0.0
+        self.primo_testo = ""
+        self.consentiti: set[str] = set()
+        self.richieste: dict[str, dict] = {}  # id -> {"futuro", "evento"}
+        self.anteprime: dict[str, str] = {}  # tool_use_id -> file da mostrare quando la scrittura riesce
+        self.connettori: list[dict] = []
+        self.mcp: dict = {}
+        self.collego: set[str] = set()
+        self.contesto: dict | None = None
+        self.davinci = False
+        self.browser = False
+        self.compiti: set[asyncio.Task] = set()
+        self.lettore: asyncio.Task | None = None
+        self.task_attivi: set[str] = set()  # agenti e comandi in background ancora al lavoro
+
+    # ----- avvio e chiusura -----
+
+    def _compito(self, coro) -> asyncio.Task:
+        compito = asyncio.create_task(coro)  # un compito senza riferimenti può sparire a metà
+        self.compiti.add(compito)
+        compito.add_done_callback(self.compiti.discard)
+        return compito
+
+    async def avvia(self) -> None:
+        try:
+            k = chiave()
+            if not k:
+                raise HTTPException(400, "Manca la chiave API: aprila nelle Impostazioni.")
+            cfg = leggi_config()
+            server = {"avvisi": create_sdk_mcp_server("avvisi", tools=[strumento_avviso])}
+            estensioni = await asyncio.to_thread(trova_estensioni)
+            server.update(estensioni)
+            plugin = await asyncio.to_thread(plugin_desktop)
+            browser = server_browser()
+            if browser:
+                server["browser"] = browser
+            extra = [c for c in cfg.get("cartelle_extra", []) if Path(c).exists()]
+            opzioni = ClaudeAgentOptions(
+                model=MODELLI.get(self.modello, MODELLI["opus"]),
+                cwd=str(self.lavoro),
+                system_prompt={"type": "preset", "preset": "claude_code", "append": istruzioni(self.cartella, self.lavoro)},
+                setting_sources=["user", "project"],
+                skills="all",
+                mcp_servers=server,
+                plugins=plugin,
+                can_use_tool=self._chiedi_permesso,
+                permission_mode=PERMESSI.get(self.permessi, "auto"),
+                include_partial_messages=True,
+                resume=self.sid,
+                add_dirs=[str(BASE), *([str(self.cartella)] if self.lavoro != self.cartella else []), *extra],
+                # Il motore in modalità SDK non offre la lista dei passi se non glielo si chiede: TodoWrite, non Task*.
+                env={"ANTHROPIC_API_KEY": k, "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1", "CLAUDE_CODE_ENABLE_TASKS": "0"},
+            )
+            self.client = ClaudeSDKClient(options=opzioni)
+            await self.client.connect()
+            # Chat ripresa: si parte dal totale già visto. None = chat nata prima di questo conteggio,
+            # il suo primo turno qui non si somma alla spesa del mese (conterebbe anche il passato).
+            self.costo = costi_chat(self.cartella).get(self.sid) if self.sid else 0.0
+            self.davinci, self.browser = bool(estensioni.get("davinci")), bool(browser)
+            self.lettore = asyncio.create_task(self._leggi())
+            self._compito(self._controlla_connettori())
+        except Exception as errore:
+            self.errore_avvio = errore
+            await self.chiudi()
+            raise
+        finally:
+            self.pronta.set()
+
+    async def chiudi(self) -> None:
+        self.chiusa = True
+        for k in self.chiavi:
+            if CHAT.get(k) is self:
+                del CHAT[k]
+        self._nega_permessi()
+        for compito in [self.lettore, *self.compiti]:
+            if compito and not compito.done() and compito is not asyncio.current_task():
+                compito.cancel()
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+        for f in list(self.spettatori):
+            f.chat = None
+        self.spettatori.clear()
+        if self.lavora:
+            self.lavora = False
+            await aggiorna_in_corso()
+
+    def libera(self) -> bool:
+        return not (self.lavora or self.task_attivi or self.coda or self.richieste or self.collego)
+
+    def forse_chiudi(self) -> None:
+        if not self.spettatori and not self.chiusa:
+            self._compito(self._chiudi_se_lasciata())
+
+    async def _chiudi_se_lasciata(self) -> None:
+        await asyncio.sleep(CHIUDI_LASCIATA_DOPO_SECONDI)
+        if not self.spettatori and self.libera() and not self.chiusa:
+            await self.chiudi()
+
+    def _registra_sid(self, sid: str | None) -> None:
+        if sid and sid != self.sid:
+            self.sid = sid
+            self.chiavi.add(sid)
+            CHAT[sid] = self
+        if sid:
+            ricorda_chat(self.cartella, sid)
+
+    # ----- chi guarda -----
+
+    async def invia(self, **dati) -> None:
+        await asyncio.gather(*(f.invia(**dati) for f in list(self.spettatori)))
+
+    async def aggancia(self, finestra: Finestra, modello: str, permessi: str) -> None:
+        # «pronto» prima di agganciarsi: la finestra ignora gli eventi della chat precedente fino a qui.
+        await finestra.invia(tipo="pronto", davinci=self.davinci, browser=self.browser)
+        self.spettatori.add(finestra)
+        finestra.chat = self
+        self.ultima = time.monotonic()
+        if self.client and modello != self.modello:
+            self.modello = modello
+            await self.client.set_model(MODELLI.get(modello, MODELLI["opus"]))
+        if self.client and permessi != self.permessi:
+            self.permessi = permessi
+            await self.client.set_permission_mode(PERMESSI.get(permessi, "auto"))
+        if self.costo:
+            await finestra.invia(tipo="costo", costo=self.costo)
+        if self.contesto:
+            await finestra.invia(**self.contesto)
+        elif self.sid and not self.lavora:
+            self._compito(self._invia_contesto())
+        if self.connettori:
+            await finestra.invia(tipo="connettori", voci=self.connettori)
+        await finestra.invia(tipo="lavora", si=self.lavora)
+        await finestra.invia(tipo="coda", coda=self._coda_visibile())
+        for r in list(self.richieste.values()):
+            await finestra.invia(**r["evento"])
+
+    # ----- permessi -----
+
+    async def _chiedi_permesso(self, nome, dati, _contesto):
+        if nome.startswith(SENZA_CONFERMA) or nome in self.consentiti:
+            return PermissionResultAllow()
+        rid = uuid.uuid4().hex
+        futuro = asyncio.get_running_loop().create_future()
+        evento = {"tipo": "permesso", "id": rid, "strumento": nome, "dettaglio": riassumi_strumento(nome, dati),
+                  "completo": json.dumps(dati, ensure_ascii=False, indent=2)[:4000]}
+        self.richieste[rid] = {"futuro": futuro, "evento": evento}  # senza spettatori resta in attesa
+        await self.invia(**evento)
+        risposta = await futuro
+        if risposta == "sempre":
+            self.consentiti.add(nome)
+        if risposta in ("si", "sempre"):
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="L'utente ha negato il permesso.")
+
+    def rispondi_permesso(self, rid: str, risposta: str) -> None:
+        richiesta = self.richieste.pop(rid, None)
+        if richiesta and not richiesta["futuro"].done():
+            richiesta["futuro"].set_result(risposta)
+
+    def _nega_permessi(self) -> None:
+        for r in self.richieste.values():
+            if not r["futuro"].done():
+                r["futuro"].set_result("no")
+        self.richieste.clear()
+
+    # ----- messaggi dell'utente e coda -----
+
+    def _coda_visibile(self) -> list[dict]:
+        return [{"id": v["id"], "testo": v["testo"]} for v in self.coda]
+
+    async def _invia_coda(self) -> None:
+        await self.invia(tipo="coda", coda=self._coda_visibile())
+
+    async def messaggio(self, testo: str, allegati: list[str], locale: bool) -> None:
+        """Con Claude al lavoro il messaggio va in coda; altrimenti parte subito."""
+        mostrato = testo + (" 📎" if allegati else "")
+        completo = testo + ("\n\nAllegati (leggili con Read):\n" + "\n".join(f"- {p}" for p in allegati) if allegati else "")
+        self.primo_testo = self.primo_testo or testo[:60]
+        if self.lavora:
+            self.coda.append({"id": uuid.uuid4().hex[:8], "testo": mostrato, "completo": completo})
+            await self._invia_coda()
+            return
+        if not locale:
+            await self.invia(tipo="utente", testo=mostrato)
+        await self._manda(completo)
+
+    async def _manda(self, completo: str) -> None:
+        uid = uuid.uuid4().hex
+        self.inviati.add(uid)
+        if not self.lavora:
+            self.lavora = True
+            self.inizio = time.monotonic()
+            self.dopo_stop = None
+            await aggiorna_in_corso()
+            await self.invia(tipo="lavora", si=True)
+        try:
+            await self.client.query(domanda(completo, uid))
+        except Exception:
+            self.inviati.discard(uid)
+            if not self.inviati and self.lavora:
+                self.lavora = False
+                await aggiorna_in_corso()
+            raise
+
+    def _prendi(self, vid: str) -> dict | None:
+        voce = next((v for v in self.coda if v["id"] == vid), None)
+        if voce:
+            self.coda.remove(voce)
+        return voce
+
+    async def togli(self, vid: str) -> None:
+        self._prendi(vid)
+        await self._invia_coda()
+
+    async def manda_ora(self, vid: str) -> None:
+        """Lo manda subito: se Claude sta lavorando lo legge al passo successivo dello stesso lavoro."""
+        voce = self._prendi(vid)
+        await self._invia_coda()
+        if voce:
+            await self.invia(tipo="utente", testo=voce["testo"])
+            await self._manda(voce["completo"])
+
+    async def ferma(self) -> None:
+        self._nega_permessi()
+        if self.lavora and self.client:
+            self.dopo_stop = "stop"
+            await self.client.interrupt()
+
+    async def ferma_e_manda(self, vid: str) -> None:
+        voce = self._prendi(vid)
+        await self._invia_coda()
+        if not voce:
+            return
+        if self.lavora and self.client:
+            self._nega_permessi()
+            self.dopo_stop = "riparti"
+            self.fine_turno.clear()
+            await self.client.interrupt()
+            try:
+                await asyncio.wait_for(self.fine_turno.wait(), ATTESA_STOP_SECONDI)
+            except asyncio.TimeoutError:
+                pass
+        await self.invia(tipo="utente", testo=voce["testo"])
+        await self._manda(voce["completo"])
+
+    # ----- lettura continua dal motore -----
+
+    async def _leggi(self) -> None:
+        try:
+            async for m in self.client.receive_messages():
+                self.ultima = time.monotonic()
+                await self._gestisci(m)
+        except asyncio.CancelledError:
+            raise
+        except Exception as errore:
+            if not self.chiusa:
+                await self.invia(tipo="errore", testo=f"{type(errore).__name__}: {errore}")
+        if not self.chiusa:
+            await self.invia(tipo="lavora", si=False)
+            await self.invia(tipo="errore", testo="La chat si è interrotta: riaprila dall'elenco.")
+            await self.chiudi()
+
+    async def _gestisci(self, m) -> None:
+        figlio = getattr(m, "parent_tool_use_id", None)
+        if isinstance(m, TaskStartedMessage):
+            self.task_attivi.add(m.task_id)
+            await aggiorna_in_corso()
+        elif isinstance(m, (TaskNotificationMessage, TaskUpdatedMessage)):
+            stato_task = m.status or (m.patch.get("status") if isinstance(m, TaskUpdatedMessage) else None)
+            if stato_task in TERMINAL_TASK_STATUSES and m.task_id in self.task_attivi:
+                self.task_attivi.discard(m.task_id)
+                await aggiorna_in_corso()
+                self.forse_chiudi()
+        if not self.lavora and not figlio and isinstance(m, (StreamEvent, AssistantMessage)):
+            # Un turno partito da solo (es. un agente in background che ha finito).
+            self.lavora = True
+            self.inizio = time.monotonic()
+            await aggiorna_in_corso()
+            await self.invia(tipo="lavora", si=True)
+        if isinstance(m, StreamEvent):
+            if figlio:
+                return
+            ev = m.event
+            if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
+                await self.invia(tipo="testo", testo=ev["delta"]["text"])
+        elif isinstance(m, AssistantMessage):
+            for b in m.content:
+                if not isinstance(b, ToolUseBlock):
+                    continue
+                if not figlio and b.name in STRUMENTI_TODO:
+                    await self.invia(tipo="passi", passi=passi_da_todo(b.input))
+                    continue
+                await self.invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(figlio))
+                rel = None if figlio else percorso_anteprima(b.name, b.input, self.lavoro)
+                if rel:
+                    self.anteprime[b.id] = rel
+        elif isinstance(m, UserMessage) and not figlio and isinstance(m.content, list):
+            for b in m.content:
+                if isinstance(b, ToolResultBlock) and not b.is_error and b.tool_use_id in self.anteprime:
+                    await self.invia(tipo="file_anteprima", percorso=self.anteprime.pop(b.tool_use_id))
+        elif isinstance(m, SystemMessage) and m.subtype == "init":
+            self._registra_sid(m.data.get("session_id"))
+            await self.invia(tipo="sessione", id=m.data.get("session_id"))
+            if self.lavora:
+                await aggiorna_in_corso()
+        elif isinstance(m, ResultMessage):
+            await self._risultato(m)
+
+    async def _risultato(self, m: ResultMessage) -> None:
+        # total_cost_usd è il totale della chat (anche dei turni di prima): si somma solo la differenza.
+        if m.total_cost_usd is not None:
+            if self.costo is not None:
+                registra_spesa(m.total_cost_usd - self.costo)
+            self.costo = m.total_cost_usd
+            ricorda_costo(self.cartella, m.session_id, m.total_cost_usd)
+        self._registra_sid(m.session_id)
+        interrotto = m.is_error or (m.terminal_reason or "").startswith("aborted")
+        if interrotto or m.user_message_uuids is None:
+            self.inviati.clear()
+        else:
+            self.inviati -= set(m.user_message_uuids)
+        dopo, self.dopo_stop = self.dopo_stop, None
+        prossimo = None
+        if not self.inviati and dopo is None and not interrotto and self.coda:
+            prossimo = self.coda.pop(0)
+        resta = bool(self.inviati) or prossimo is not None or dopo == "riparti"
+        await self.invia(tipo="fine", costo=self.costo or 0.0, sessione=m.session_id, lavora=resta,
+                         errore=spiega_errore(m.result or m.subtype) if m.is_error and dopo is None else None,
+                         spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
+        self.fine_turno.set()
+        self._compito(self._invia_contesto())
+        if prossimo:
+            await self._invia_coda()
+            await self.invia(tipo="utente", testo=prossimo["testo"])
+            await self._manda(prossimo["completo"])
+        if resta:
+            return
+        durata = time.monotonic() - self.inizio
+        self.lavora = False
+        await aggiorna_in_corso()
+        if dopo is None:
+            self._compito(self._finito(durata))
+        self.forse_chiudi()
+
+    async def _finito(self, durata: float) -> None:
+        titolo = None
+        try:
+            info = await asyncio.to_thread(get_session_info, self.sid, str(self.lavoro))
+            titolo = info and (info.custom_title or info.first_prompt or info.summary)
+        except Exception:
+            pass
+        titolo = (titolo or self.primo_testo or "Chat")[:60]
+        await a_tutte(tipo="chat_finita", progetto=self.nome_progetto, sessione=self.sid, titolo=titolo)
+        if durata > AVVISO_TELEFONO_DOPO_SECONDI:
+            await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{self.nome_progetto}».")
+
+    # ----- contesto e connettori -----
+
+    async def _invia_contesto(self) -> None:
+        """Quanto contesto usa la chat e a che punto si compatta da sola (come /context in Claude Code)."""
+        try:
+            uso = await self.client.get_context_usage()
+        except Exception:
+            return
+        self.contesto = {"tipo": "contesto", "usati": uso.get("totalTokens", 0),
+                         "massimo": uso.get("autoCompactThreshold") or uso.get("maxTokens", 0),
+                         "auto": uso.get("isAutoCompactEnabled", True)}
+        await self.invia(**self.contesto)
+
+    async def _leggi_connettori(self) -> None:
+        self.mcp = await self.client.get_mcp_status()
+        voci = connettori_remoti(self.mcp)
+        for v in voci:
+            if v["server"] in self.collego and v["stato"] != "ok":
+                v["stato"] = "collego"
+        self.connettori = voci
+        await self.invia(tipo="connettori", voci=voci)
+
+    async def _controlla_connettori(self) -> None:
+        """Appena aperta la chat i server remoti si stanno ancora collegando: si guarda per un po'."""
+        for _ in range(8):
+            try:
+                await self._leggi_connettori()
+            except Exception:
+                return
+            if not any(v["stato"] == "attesa" for v in self.connettori):
+                return
+            await asyncio.sleep(4)
+
+    async def collega(self, server: str) -> None:
+        voce = next((v for v in self.connettori if v["server"] == server and v["stato"] == "login"), None)
+        client = self.client
+        if not voce or not client:
+            return
+        self.collego.add(server)
+        await self._leggi_connettori()
+        try:
+            ok = await asyncio.to_thread(login_connettore, server)
+        finally:
+            self.collego.discard(server)
+        if ok and self.client is client:
+            # Il login vale per indirizzo: si ricollegano tutti i server con lo stesso servizio.
+            for s in self.mcp.get("mcpServers", []):
+                if (s.get("config") or {}).get("url") == voce["url"] and s.get("status") != "connected":
+                    try:
+                        await client.reconnect_mcp_server(s["name"])
+                    except Exception:
+                        pass
+        if self.client is client:
+            await self._leggi_connettori()
+            if not ok:
+                await self.invia(tipo="errore", testo=f"Collegamento a {voce['nome']} non riuscito o annullato.")
+
+
+async def apri_chat(finestra: Finestra, dati: dict) -> None:
+    """La finestra guarda una chat: quella già aperta se c'è (mai due client per la stessa chat), altrimenti una nuova.
+    La chat che guardava prima resta aperta e continua a lavorare."""
+    finestra.stacca()
+    progetto, sid = dati["progetto"], dati.get("sessione")
+    cartella = cartella_progetto(progetto)
+    if sid and cartella_lavoro(progetto) != cartella:
+        chat_permessa(sid, progetto)
+    (cartella / "allegati").mkdir(exist_ok=True)
+    modello = dati.get("modello", "opus")
+    permessi = dati.get("permessi", leggi_config().get("permessi", "auto"))
+    k = sid or str(dati.get("chiave") or uuid.uuid4().hex)
+    chat = CHAT.get(k)
+    if chat is None:
+        chat = CHAT[k] = Chat(progetto, sid, k, modello, permessi)
+        await chat.avvia()
+    else:
+        await chat.pronta.wait()
+        if chat.errore_avvio:
+            raise chat.errore_avvio
+    await chat.aggancia(finestra, modello, permessi)
+
+
+async def chiudi_chat_inattive() -> None:
+    """Una chat che nessuno guarda e che non lavora si chiude dopo un po': ogni chat aperta è un processo."""
+    while True:
+        await asyncio.sleep(60)
+        for chat in chat_aperte():
+            if not chat.spettatori and chat.libera() and time.monotonic() - chat.ultima > CHIUDI_CHAT_DOPO_MINUTI * 60:
+                await chat.chiudi()
+
+
 @app.websocket("/ws")
 async def sessione(ws: WebSocket):
     if ws.headers.get("origin") not in ORIGINI or ws.headers.get("host") not in HOST_OK:
         await ws.close(code=1008)
         return
     await ws.accept()
-    ATTIVITA["finestre"] += 1
-
-    stato = {"client": None, "progetto": None, "consentiti": set(), "costo": 0.0, "lavoro": None,
-             "connettori": [], "mcp": {}, "collego": set(), "controllo": None, "cartella_lavoro": None}
-    richieste: dict[str, asyncio.Future] = {}
-    compiti: set[asyncio.Task] = set()
-
-    async def invia(**dati):
-        try:
-            await ws.send_json(dati)
-        except Exception:
-            pass
-
-    async def chiedi_permesso(nome, dati, _contesto):
-        if nome.startswith(SENZA_CONFERMA) or nome in stato["consentiti"]:
-            return PermissionResultAllow()
-        rid = uuid.uuid4().hex
-        futuro = asyncio.get_running_loop().create_future()
-        richieste[rid] = futuro
-        await invia(tipo="permesso", id=rid, strumento=nome, dettaglio=riassumi_strumento(nome, dati),
-                    completo=json.dumps(dati, ensure_ascii=False, indent=2)[:4000])
-        risposta = await futuro
-        if risposta == "sempre":
-            stato["consentiti"].add(nome)
-        if risposta in ("si", "sempre"):
-            return PermissionResultAllow()
-        return PermissionResultDeny(message="L'utente ha negato il permesso.")
-
-    async def chiudi():
-        for futuro in richieste.values():
-            if not futuro.done():
-                futuro.set_result("no")
-        richieste.clear()
-        for compito in (stato["lavoro"], stato["controllo"]):
-            if compito and not compito.done():
-                compito.cancel()
-        if stato["client"]:
-            try:
-                await stato["client"].disconnect()
-            except Exception:
-                pass
-        stato["client"] = None
-
-    async def apri(progetto: str, sid: str | None, modello: str, permessi: str):
-        await chiudi()
-        cartella = cartella_progetto(progetto)
-        lavoro = cartella_lavoro(progetto)
-        if sid and lavoro != cartella:
-            chat_permessa(sid, progetto)
-        (cartella / "allegati").mkdir(exist_ok=True)
-        k = chiave()
-        if not k:
-            await invia(tipo="errore", testo="Manca la chiave API: aprila nelle Impostazioni.")
-            return
-        cfg = leggi_config()
-        server = {"avvisi": create_sdk_mcp_server("avvisi", tools=[strumento_avviso])}
-        estensioni = await asyncio.to_thread(trova_estensioni)
-        server.update(estensioni)
-        plugin = await asyncio.to_thread(plugin_desktop)
-        davinci = estensioni.get("davinci")
-        browser = server_browser()
-        if browser:
-            server["browser"] = browser
-        extra = [c for c in cfg.get("cartelle_extra", []) if Path(c).exists()]
-        opzioni = ClaudeAgentOptions(
-            model=MODELLI.get(modello, MODELLI["opus"]),
-            cwd=str(lavoro),
-            system_prompt={"type": "preset", "preset": "claude_code", "append": istruzioni(cartella, lavoro)},
-            setting_sources=["user", "project"],
-            skills="all",
-            mcp_servers=server,
-            plugins=plugin,
-            can_use_tool=chiedi_permesso,
-            permission_mode=PERMESSI.get(permessi, "auto"),
-            include_partial_messages=True,
-            resume=sid,
-            add_dirs=[str(BASE), *([str(cartella)] if lavoro != cartella else []), *extra],
-            # Il motore in modalità SDK non offre la lista dei passi se non glielo si chiede: TodoWrite, non Task*.
-            env={"ANTHROPIC_API_KEY": k, "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1", "CLAUDE_CODE_ENABLE_TASKS": "0"},
-        )
-        client = ClaudeSDKClient(options=opzioni)
-        await client.connect()
-        # Chat ripresa: si parte dal totale già visto. None = chat nata prima di questo conteggio,
-        # il suo primo turno qui non si somma alla spesa del mese (conterebbe anche il passato).
-        costo = costi_chat(cartella).get(sid) if sid else 0.0
-        stato.update(client=client, progetto=cartella, cartella_lavoro=lavoro, consentiti=set(), costo=costo)
-        await invia(tipo="pronto", davinci=bool(davinci), browser=bool(browser))
-        stato["controllo"] = asyncio.create_task(controlla_connettori(client))
-        if sid:
-            if costo:
-                await invia(tipo="costo", costo=costo)
-            await invia_contesto(client)
-
-    async def invia_contesto(client) -> None:
-        """Quanto contesto usa la chat e a che punto si compatta da sola (come /context in Claude Code)."""
-        try:
-            uso = await client.get_context_usage()
-        except Exception:
-            return
-        await invia(tipo="contesto", usati=uso.get("totalTokens", 0),
-                    massimo=uso.get("autoCompactThreshold") or uso.get("maxTokens", 0),
-                    auto=uso.get("isAutoCompactEnabled", True))
-
-    async def leggi_connettori(client) -> None:
-        stato["mcp"] = await client.get_mcp_status()
-        voci = connettori_remoti(stato["mcp"])
-        for v in voci:
-            if v["server"] in stato["collego"] and v["stato"] != "ok":
-                v["stato"] = "collego"
-        stato["connettori"] = voci
-        await invia(tipo="connettori", voci=voci)
-
-    async def controlla_connettori(client) -> None:
-        """Appena aperta la chat i server remoti si stanno ancora collegando: si guarda per un po'."""
-        for _ in range(8):
-            try:
-                await leggi_connettori(client)
-            except Exception:
-                return
-            if not any(v["stato"] == "attesa" for v in stato["connettori"]):
-                return
-            await asyncio.sleep(4)
-
-    async def collega(server: str) -> None:
-        voce = next((v for v in stato["connettori"] if v["server"] == server and v["stato"] == "login"), None)
-        client = stato["client"]
-        if not voce or not client:
-            return
-        stato["collego"].add(server)
-        await leggi_connettori(client)
-        try:
-            ok = await asyncio.to_thread(login_connettore, server)
-        finally:
-            stato["collego"].discard(server)
-        if ok and stato["client"] is client:
-            # Il login vale per indirizzo: si ricollegano tutti i server con lo stesso servizio.
-            for s in stato["mcp"].get("mcpServers", []):
-                if (s.get("config") or {}).get("url") == voce["url"] and s.get("status") != "connected":
-                    try:
-                        await client.reconnect_mcp_server(s["name"])
-                    except Exception:
-                        pass
-        if stato["client"] is client:
-            await leggi_connettori(client)
-            if not ok:
-                await invia(tipo="errore", testo=f"Collegamento a {voce['nome']} non riuscito o annullato.")
-
-    async def esegui(testo: str):
-        ATTIVITA["lavori"] += 1
-        try:
-            await _esegui(testo)
-        finally:
-            ATTIVITA["lavori"] -= 1
-            ATTIVITA["ultima"] = time.monotonic()
-
-    async def _esegui(testo: str):
-        client = stato["client"]
-        inizio = time.monotonic()
-        costo_prima = stato["costo"]
-        anteprime: dict[str, str] = {}  # tool_use_id -> file da mostrare quando la scrittura riesce
-        try:
-            await client.query(testo)
-            async for m in client.receive_response():
-                if isinstance(m, StreamEvent):
-                    if m.parent_tool_use_id:
-                        continue
-                    ev = m.event
-                    if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
-                        await invia(tipo="testo", testo=ev["delta"]["text"])
-                elif isinstance(m, AssistantMessage):
-                    for b in m.content:
-                        if not isinstance(b, ToolUseBlock):
-                            continue
-                        if not m.parent_tool_use_id and b.name in STRUMENTI_TODO:
-                            await invia(tipo="passi", passi=passi_da_todo(b.input))
-                            continue
-                        await invia(tipo="strumento", testo=riassumi_strumento(b.name, b.input), sotto=bool(m.parent_tool_use_id))
-                        rel = None if m.parent_tool_use_id else percorso_anteprima(b.name, b.input, stato["cartella_lavoro"])
-                        if rel:
-                            anteprime[b.id] = rel
-                elif isinstance(m, UserMessage) and not m.parent_tool_use_id and isinstance(m.content, list):
-                    for b in m.content:
-                        if isinstance(b, ToolResultBlock) and not b.is_error and b.tool_use_id in anteprime:
-                            await invia(tipo="file_anteprima", percorso=anteprime.pop(b.tool_use_id))
-                elif isinstance(m, SystemMessage) and m.subtype == "init":
-                    ricorda_chat(stato["progetto"], m.data.get("session_id"))
-                    await invia(tipo="sessione", id=m.data.get("session_id"))
-                elif isinstance(m, ResultMessage):
-                    # total_cost_usd è il totale della chat (anche dei turni di prima): si somma solo la differenza.
-                    if m.total_cost_usd is not None:
-                        if costo_prima is not None:
-                            registra_spesa(m.total_cost_usd - costo_prima)
-                        stato["costo"] = m.total_cost_usd
-                        ricorda_costo(stato["progetto"], m.session_id, m.total_cost_usd)
-                    ricorda_chat(stato["progetto"], m.session_id)
-                    await invia(tipo="fine", costo=stato["costo"] or 0.0, sessione=m.session_id,
-                                errore=spiega_errore(m.result or m.subtype) if m.is_error else None,
-                                spesa_mese=leggi_config().get("spesa_mese", {}).get(time.strftime("%Y-%m"), 0))
-            await invia_contesto(client)
-            if time.monotonic() - inizio > 120:
-                await asyncio.to_thread(avvisa_telefono, f"Ho finito il lavoro su «{stato['progetto'].name}».")
-        except asyncio.CancelledError:
-            raise
-        except Exception as errore:
-            await invia(tipo="errore", testo=f"{type(errore).__name__}: {errore}")
-
+    finestra = Finestra(ws)
+    FINESTRE.add(finestra)
+    ATTIVITA["finestre"] = len(FINESTRE)
+    await finestra.invia(tipo="in_corso", chat=elenco_in_corso())
     try:
         while True:
             dati = await ws.receive_json()
             tipo = dati.get("tipo")
+            chat = finestra.chat
             try:
                 if tipo == "apri":
-                    await apri(dati["progetto"], dati.get("sessione"), dati.get("modello", "opus"),
-                               dati.get("permessi", leggi_config().get("permessi", "auto")))
-                elif tipo == "messaggio" and stato["client"]:
-                    if stato["lavoro"] and not stato["lavoro"].done():
-                        await invia(tipo="errore", testo="Sto ancora lavorando: aspetta o premi Stop.")
+                    await apri_chat(finestra, dati)
+                elif tipo == "permesso" and chat:
+                    chat.rispondi_permesso(dati.get("id"), dati.get("risposta", "no"))
+                elif tipo == "messaggio":
+                    if not chat or chat.chiusa:
+                        await finestra.invia(tipo="errore", testo="La chat non è aperta: riaprila dall'elenco.")
                         continue
-                    testo = dati.get("testo", "").strip()
-                    if dati.get("allegati"):
-                        testo += "\n\nAllegati (leggili con Read):\n" + "\n".join(f"- {p}" for p in dati["allegati"])
-                    stato["lavoro"] = asyncio.create_task(esegui(testo))
-                elif tipo == "stop" and stato["client"]:
-                    for futuro in richieste.values():
-                        if not futuro.done():
-                            futuro.set_result("no")
-                    await stato["client"].interrupt()
-                elif tipo == "permessi" and stato["client"]:
-                    await stato["client"].set_permission_mode(PERMESSI.get(dati.get("modo"), "auto"))
-                elif tipo == "modello" and stato["client"]:
-                    await stato["client"].set_model(MODELLI.get(dati.get("modello"), MODELLI["opus"]))
-                elif tipo == "collega" and stato["client"]:
-                    compito = asyncio.create_task(collega(str(dati.get("server", ""))))
-                    compiti.add(compito)  # un compito senza riferimenti può sparire a metà
-                    compito.add_done_callback(compiti.discard)
-                elif tipo == "permesso":
-                    futuro = richieste.pop(dati.get("id"), None)
-                    if futuro and not futuro.done():
-                        futuro.set_result(dati.get("risposta", "no"))
-            except HTTPException as errore:
-                await invia(tipo="errore", testo=errore.detail)
+                    await chat.messaggio(dati.get("testo", "").strip(), dati.get("allegati") or [], bool(dati.get("locale")))
+                elif tipo == "stop" and chat:
+                    await chat.ferma()
+                elif tipo == "togli" and chat:
+                    await chat.togli(str(dati.get("id")))
+                elif tipo == "manda_ora" and chat:
+                    await chat.manda_ora(str(dati.get("id")))
+                elif tipo == "ferma_e_manda" and chat:
+                    chat._compito(chat.ferma_e_manda(str(dati.get("id"))))  # aspetta la fine dell'interruzione: non blocca la finestra
+                elif tipo == "permessi" and chat and chat.client:
+                    chat.permessi = dati.get("modo", "auto")
+                    await chat.client.set_permission_mode(PERMESSI.get(chat.permessi, "auto"))
+                elif tipo == "modello" and chat and chat.client:
+                    chat.modello = dati.get("modello", "opus")
+                    await chat.client.set_model(MODELLI.get(chat.modello, MODELLI["opus"]))
+                elif tipo == "collega" and chat and chat.client:
+                    chat._compito(chat.collega(str(dati.get("server", ""))))
             except Exception as errore:
-                await invia(tipo="errore", testo=f"{type(errore).__name__}: {errore}")
+                testo = errore.detail if isinstance(errore, HTTPException) else f"{type(errore).__name__}: {errore}"
+                await finestra.invia(tipo="errore", testo=testo)
+                if tipo in ("apri", "messaggio"):  # la finestra non deve restare ferma su «sta lavorando»
+                    await finestra.invia(tipo="lavora", si=bool(finestra.chat and finestra.chat.lavora))
     except WebSocketDisconnect:
         pass
     finally:
-        ATTIVITA["finestre"] -= 1
+        finestra.stacca()
+        FINESTRE.discard(finestra)
+        ATTIVITA["finestre"] = len(FINESTRE)
         ATTIVITA["ultima"] = time.monotonic()
-        await chiudi()
 
 
 def spegni_se_inattivo() -> None:

@@ -7,9 +7,11 @@ const el = {
   spesaMese: $('#spesa-mese'), contesto: $('#contesto'),
   anteprima: $('#anteprima'), anteprimaFile: $('#anteprima-file'), anteprimaFrame: $('#anteprima-frame'),
   anteprimaMessaggio: $('#anteprima-messaggio'), anteprimaUrl: $('#anteprima-url'),
+  coda: $('#coda'), avvisi: $('#avvisi'),
 };
 
-let stato = { progetto: null, sessione: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null };
+let stato = { progetto: null, sessione: null, chiave: null, lavoro: false, allegati: [], bolla: null, ws: null, pronto: false, inAttesa: [], coda: [], passi: null, inCorso: [], apertura: 0 };
+const TITOLO = 'Assistente All2Points';
 
 // ---- comandi dichiarativi per i <dialog> (fallback per browser senza Invoker Commands) ----
 if (!('commandForElement' in HTMLButtonElement.prototype)) {
@@ -59,7 +61,7 @@ async function api(percorso, opzioni = {}) {
   return dati;
 }
 const q = (p) => `progetto=${encodeURIComponent(p)}`;
-const dollari = (n) => `${(n || 0).toFixed(2)} $`;
+const dollari = (n) => (n > 0 && n < 0.01 ? '< 0.01 $' : `${(n || 0).toFixed(2)} $`);
 
 // ---- messaggi ----
 function scorri() { el.messaggi.scrollTop = el.messaggi.scrollHeight; }
@@ -102,11 +104,84 @@ function vuoto() {
 }
 function inLavoro(si) {
   stato.lavoro = si;
-  el.elenco.querySelector('a[aria-current="true"]')?.classList.toggle('in-corso', si);
-  el.invia.hidden = si;
   el.stop.hidden = !si;
+  el.invia.title = si ? 'Claude sta lavorando: il messaggio va in coda' : '';
   indicatore(si);
+  segniInCorso();
 }
+// Chat al lavoro: l'elenco globale arriva dal motore, vale per qualsiasi chat di qualsiasi progetto.
+function segniInCorso() {
+  const qui = stato.inCorso.filter((x) => x.progetto === stato.progetto);
+  el.elenco.querySelectorAll('a').forEach((a) => {
+    const lavora = a.dataset.sid ? qui.some((x) => x.sessione === a.dataset.sid) : false;
+    a.classList.toggle('in-corso', lavora || (a.dataset.corrente === '1' && stato.lavoro));
+  });
+  const progetti = new Set(stato.inCorso.map((x) => x.progetto));
+  for (const o of el.progetto.options) o.text = o.dataset.base + (progetti.has(o.value) ? ' ●' : '');
+}
+// Riquadro «In coda»: i messaggi scritti mentre Claude lavora.
+function disegnaCoda(coda) {
+  el.coda.hidden = !coda.length;
+  const titolo = document.createElement('strong');
+  titolo.textContent = 'In coda';
+  const voci = coda.map((c) => {
+    const riga = document.createElement('div');
+    riga.className = 'coda-voce';
+    const testo = document.createElement('span');
+    testo.textContent = c.testo;
+    const bottone = (etichetta, aiuto, tipo, classe) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = classe;
+      b.textContent = etichetta;
+      b.title = aiuto;
+      b.addEventListener('click', () => invia({ tipo, id: c.id }));
+      return b;
+    };
+    riga.append(testo,
+      bottone('Aggiungi al lavoro', 'Claude lo legge al prossimo passo senza fermarsi', 'manda_ora', 'secondario'),
+      bottone('Ferma e manda', 'Interrompe il lavoro e manda subito questo messaggio', 'ferma_e_manda', 'secondario'),
+      bottone('✕', 'Togli dalla coda', 'togli', 'secondario icona'));
+    return riga;
+  });
+  el.coda.replaceChildren(titolo, ...voci);
+}
+
+// ---- bozze: quello che è scritto e non inviato, per progetto e chat ----
+const bozza = {
+  chiave: () => `a2p-bozza-${stato.progetto}-${stato.sessione || 'nuova'}`,
+  leggi: () => { try { return localStorage.getItem(bozza.chiave()) || ''; } catch { return ''; } },
+  salva: (chiave = bozza.chiave()) => {
+    try { el.testo.value ? localStorage.setItem(chiave, el.testo.value) : localStorage.removeItem(chiave); } catch {}
+  },
+  cancella: (chiave = bozza.chiave()) => { try { localStorage.removeItem(chiave); } catch {} },
+};
+
+// ---- avvisi a comparsa e titolo della finestra ----
+function avvisoFinito(m) {
+  document.title = `● ${TITOLO}`;
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'avviso';
+  b.textContent = `Ha finito: ${m.titolo} (${m.progetto})`;
+  const togli = () => b.remove();
+  b.addEventListener('click', () => { togli(); apriDaAvviso(m); });
+  el.avvisi.append(b);
+  setTimeout(togli, 8000);
+}
+async function apriDaAvviso(m) {
+  if (m.progetto !== stato.progetto) {
+    el.progetto.value = m.progetto;
+    stato.progetto = m.progetto;
+    try { localStorage.setItem('a2p-progetto', m.progetto); } catch {}
+    await caricaChat();
+  }
+  if (m.sessione) apriChat(m.sessione, m.titolo);
+  else cambiaProgetto();
+}
+const titoloNormale = () => { document.title = TITOLO; };
+window.addEventListener('focus', titoloNormale);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) titoloNormale(); });
 
 // ---- connessione ----
 function connetti() {
@@ -119,7 +194,7 @@ function connetti() {
   ws.onopen = () => {
     const coda = stato.coda.splice(0);
     if (coda.length) coda.forEach((d) => ws.send(JSON.stringify(d)));
-    else if (stato.progetto) apriChat(stato.sessione);
+    else if (stato.progetto) apriChat(stato.sessione, undefined, stato.chiave);
   };
 }
 function invia(dati) {
@@ -127,10 +202,36 @@ function invia(dati) {
   else if (dati.tipo === 'apri') stato.coda = [dati];
 }
 
+// Dopo «apri» la finestra ignora gli eventi della chat di prima fino a «pronto».
+const SEMPRE = ['pronto', 'in_corso', 'chat_finita', 'errore'];
 function ricevi(m) {
+  if (!stato.pronto && !SEMPRE.includes(m.tipo)) return;
   switch (m.tipo) {
+    case 'in_corso':
+      stato.inCorso = m.chat;
+      segniInCorso();
+      break;
+    case 'lavora':
+      // Appena aperta, la chat dice «ferma» prima di ricevere il messaggio mandato in quel momento: non è vero.
+      if (!m.si && stato.mandatoInApertura) { stato.mandatoInApertura = false; break; }
+      stato.mandatoInApertura = false;
+      inLavoro(m.si);
+      break;
+    case 'coda':
+      disegnaCoda(m.coda);
+      break;
+    case 'utente':
+      stato.bolla = null;
+      stato.passi = null;
+      aggiungi('msg utente', m.testo);
+      indicatore(true);
+      break;
+    case 'chat_finita':
+      if (m.progetto !== stato.progetto || m.sessione !== stato.sessione) avvisoFinito(m);
+      break;
     case 'pronto':
       stato.pronto = true;
+      stato.mandatoInApertura = stato.inAttesa.some((d) => d.tipo === 'messaggio');
       for (const d of stato.inAttesa.splice(0)) invia(d);
       break;
     case 'costo':
@@ -152,7 +253,10 @@ function ricevi(m) {
       break;
     case 'sessione':
       if (m.id && m.id !== stato.sessione) {
+        const vecchia = bozza.chiave();
         stato.sessione = m.id;
+        stato.chiave = null;
+        if (el.testo.value) { bozza.salva(); bozza.cancella(vecchia); }  // la bozza della chat nuova segue la chat
         ultimaChat.salva(stato.progetto, m.id);
         caricaChat();
       }
@@ -188,7 +292,7 @@ function ricevi(m) {
       break;
     case 'fine':
       stato.bolla = null;
-      inLavoro(false);
+      inLavoro(m.lavora);
       if (m.errore) aggiungi('msg claude errore', m.errore);
       if (m.errore?.startsWith('La chiave API')) $('#dlg-impostazioni').showModal();
       el.costo.textContent = `Questa chat: ${dollari(m.costo)}`;
@@ -197,7 +301,6 @@ function ricevi(m) {
       caricaChat().then(() => { stato.titoloProvvisorio = null; });
       break;
     case 'errore':
-      inLavoro(false);
       aggiungi('msg claude errore', m.testo);
       break;
   }
@@ -229,10 +332,12 @@ async function caricaProgetti(scegli) {
   for (const p of elenco) {
     const voce = new Option(p.cartella ? `📁 ${p.nome}` : p.nome, p.nome);
     if (p.cartella) voce.title = p.cartella;
+    voce.dataset.base = voce.text;
     el.progetto.append(voce);
   }
   const salvato = scegli || localStorage.getItem('a2p-progetto');
   if (salvato && elenco.some((p) => p.nome === salvato)) el.progetto.value = salvato;
+  segniInCorso();
   await cambiaProgetto();
 }
 
@@ -261,14 +366,14 @@ async function caricaChat() {
     a.innerHTML = `<span></span><button title="Elimina chat" aria-label="Elimina chat">✕</button>`;
     a.querySelector('span').textContent = c.titolo;
     a.title = c.titolo;
-    if (c.id === stato.sessione) { a.setAttribute('aria-current', 'true'); el.titolo.textContent = c.titolo; }
+    a.dataset.sid = c.id;
+    if (c.id === stato.sessione) { a.setAttribute('aria-current', 'true'); a.dataset.corrente = '1'; el.titolo.textContent = c.titolo; }
     a.addEventListener('click', (e) => {
       e.preventDefault();
       if (e.target.closest('button')) return eliminaChat(c);
-      if (!stato.lavoro) apriChat(c.id, c.titolo);
+      apriChat(c.id, c.titolo);
     });
     a.addEventListener('dblclick', () => rinominaChat(c));
-    if (c.id === stato.sessione && stato.lavoro) a.classList.add('in-corso');
     el.elenco.append(a);
   }
   // Chat appena iniziata: compare subito in cima, anche prima che sia salvata sul disco.
@@ -277,16 +382,20 @@ async function caricaChat() {
     a.href = '#';
     a.className = stato.lavoro ? 'in-corso' : '';
     a.setAttribute('aria-current', 'true');
+    a.dataset.corrente = '1';
     a.innerHTML = '<span></span>';
     a.querySelector('span').textContent = stato.titoloProvvisorio;
     a.addEventListener('click', (e) => e.preventDefault());
     el.elenco.prepend(a);
   }
+  segniInCorso();
   return chat;
 }
 
-async function apriChat(sid, titolo) {
+async function apriChat(sid, titolo, chiave) {
+  const apertura = ++stato.apertura;
   stato.sessione = sid;
+  stato.chiave = sid ? null : (chiave || crypto.randomUUID());
   ultimaChat.salva(stato.progetto, sid);
   stato.bolla = null;
   stato.passi = null;
@@ -297,8 +406,13 @@ async function apriChat(sid, titolo) {
   el.titolo.textContent = titolo || 'Nuova chat';
   el.elenco.querySelectorAll('a').forEach((a) => a.removeAttribute('aria-current'));
   vuoto();
+  inLavoro(false);
+  disegnaCoda([]);
+  el.testo.value = bozza.leggi();
+  if (sid) titoloNormale();
   if (sid) {
     const righe = await api(`/api/chat/${sid}?${q(stato.progetto)}`);
+    if (apertura !== stato.apertura) return;
     if (righe.length) el.messaggi.innerHTML = '';
     let passi = null;  // più aggiornamenti della lista tra due messaggi dell'utente restano un riquadro solo
     for (const r of righe) {
@@ -310,7 +424,7 @@ async function apriChat(sid, titolo) {
     }
     caricaChat();
   }
-  invia({ tipo: 'apri', progetto: stato.progetto, sessione: sid, modello: el.modello.value, permessi: $('#permessi').value });
+  invia({ tipo: 'apri', progetto: stato.progetto, sessione: sid, chiave: stato.chiave, modello: el.modello.value, permessi: $('#permessi').value });
 }
 
 async function eliminaChat(c) {
@@ -355,22 +469,27 @@ function mostraAllegati() {
 el.form.addEventListener('submit', (e) => {
   e.preventDefault();
   const testo = el.testo.value.trim();
-  if ((!testo && !stato.allegati.length) || stato.lavoro) return;
-  const dati = { tipo: 'messaggio', testo: testo || 'Guarda gli allegati.', allegati: stato.allegati.map((a) => a.percorso) };
-  aggiungi('msg utente', testo + (stato.allegati.length ? `\n📎 ${stato.allegati.map((a) => a.nome).join(', ')}` : ''));
-  if (!stato.sessione) {
-    stato.titoloProvvisorio = (testo || 'Allegati').slice(0, 70);
-    el.titolo.textContent = stato.titoloProvvisorio;
+  if (!testo && !stato.allegati.length) return;
+  // Con Claude al lavoro il messaggio va in coda (lo disegna il riquadro «In coda»); altrimenti parte subito.
+  const dati = { tipo: 'messaggio', testo: testo || 'Guarda gli allegati.', allegati: stato.allegati.map((a) => a.percorso), locale: !stato.lavoro };
+  if (!stato.lavoro) {
+    aggiungi('msg utente', testo + (stato.allegati.length ? `\n📎 ${stato.allegati.map((a) => a.nome).join(', ')}` : ''));
+    if (!stato.sessione) {
+      stato.titoloProvvisorio = (testo || 'Allegati').slice(0, 70);
+      el.titolo.textContent = stato.titoloProvvisorio;
+    }
+    stato.bolla = null;
+    stato.passi = null;
+    inLavoro(true);
+    if (stato.titoloProvvisorio && !stato.sessione) caricaChat();
   }
   el.testo.value = '';
+  bozza.cancella();
   stato.allegati = [];
   mostraAllegati();
-  stato.bolla = null;
-  stato.passi = null;
-  inLavoro(true);
-  if (stato.titoloProvvisorio && !stato.sessione) caricaChat();
   if (stato.pronto) invia(dati); else stato.inAttesa.push(dati);
 });
+el.testo.addEventListener('input', () => bozza.salva());
 el.testo.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); el.form.requestSubmit(); }
 });
@@ -381,8 +500,8 @@ $('#permessi').addEventListener('change', () => {
   invia({ tipo: 'permessi', modo });
   api('/api/impostazioni', { method: 'POST', body: JSON.stringify({ permessi: modo }) }).catch(() => {});
 });
-el.progetto.addEventListener('change', () => { if (!stato.lavoro) cambiaProgetto(); });
-$('#nuova-chat').addEventListener('click', () => { if (!stato.lavoro) { apriChat(null); caricaChat(); } });
+el.progetto.addEventListener('change', cambiaProgetto);
+$('#nuova-chat').addEventListener('click', () => { apriChat(null); caricaChat(); });
 el.file.addEventListener('change', () => { caricaFile([...el.file.files]); el.file.value = ''; });
 el.testo.addEventListener('paste', (e) => {
   const immagini = [...e.clipboardData.files];
