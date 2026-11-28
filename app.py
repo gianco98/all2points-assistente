@@ -1112,6 +1112,8 @@ class Chat:
                 can_use_tool=self._chiedi_permesso,
                 permission_mode=PERMESSI.get(self.permessi, "auto"),
                 include_partial_messages=True,
+                # Il limite predefinito (1 MB) spezza la chat quando Claude legge un'immagine grande (screenshot, fotogrammi).
+                max_buffer_size=64 * 1024 * 1024,
                 resume=self.sid,
                 add_dirs=[str(BASE), *([str(self.cartella)] if self.lavoro != self.cartella else []), *extra],
                 # Il motore in modalità SDK non offre la lista dei passi se non glielo si chiede: TodoWrite, non Task*.
